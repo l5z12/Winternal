@@ -173,10 +173,13 @@ Driver management (admin):
 NTFS monitoring + analyzing:
   ntfs vols                             NTFS volumes + cluster/MFT metadata
   ntfs usn <vol> [--tail] [--count N]   USN journal snapshot or live tail
+  ntfs monitor <vol> [--reasons LIST]   colorized real-time activity stream
   ntfs mft <vol> [--limit N] [--name S] MFT walk via FSCTL_ENUM_USN_DATA
   ntfs streams <path>                   alternate data streams (ADS)
   ntfs compare <path>                   FindFirstFile vs MFT diff (hide detect)
-  ntfs raw <device> <off> <len>         driver-backed raw read (bypasses minifilters) (bypasses SCM)
+  ntfs raw <device> <off> <len>         driver-backed raw read (bypasses minifilters)
+  ntfs filter add <pat> <action>        block/redirect file opens (kernel NtCreateFile hook)
+  ntfs filter list | remove <id> | clear (bypasses SCM)
 
 Plugins:
   plugin list                        plugin info <name>
@@ -467,6 +470,7 @@ state file across the disable / revert cycle.
 | `KDRV_REGISTER / LOAD / UNLOAD / DEREGISTER / SET_START` | SCM-bypassing driver lifecycle (ZwLoadDriver + reg writes) |
 | `NTFS_RAW_READ`                      | ZwReadFile on a `\Device\*` from kernel mode |
 | `NTFS_VOL_DATA / USN_QUERY / USN_READ / MFT_ENUM / STREAMS` | FSCTL passthrough via `ZwFsControlFile` + `ZwQueryInformationFile` (PreviousMode=Kernel) |
+| `NTFS_FILTER_ADD / REMOVE / LIST / CLEAR` | rule-driven minifilter (FltRegisterFilter + pre-create); in-house path-aware wildcard matcher (`*` spans `\`); actions deny / notfound / readonly / log — HVCI-compatible |
 | `SELFPROTECT_SET / STATUS`           | owner-PID gate on weaken-protection IOCTLs (force-unload, protect-unlock, selfprotect-off) |
 
 Every state-mutating IOCTL is SEH-wrapped at the dispatcher level, audited

@@ -101,6 +101,56 @@ int CheckTestSigning() {
 // leftover DACL. Implementation lives near the selfprotect helpers below.
 static bool RecoverServiceRegistry();
 
+// Minifilter registry setup. FltRegisterFilter requires:
+//   Services\Winternal\Instances                  (key)
+//     DefaultInstance = "WinternalDefault"        (REG_SZ)
+//   Services\Winternal\Instances\WinternalDefault (subkey)
+//     Altitude = "385720.1932"                    (REG_SZ — free range)
+//     Flags    = 0                                (REG_DWORD)
+//   Services\Winternal\DependOnService = "FltMgr" (REG_MULTI_SZ; ensures
+//                                                  fltmgr loads first)
+// Without these the driver registers fine as a kernel service but
+// FltRegisterFilter returns 0xC03A0014 (STATUS_FLT_NOT_INITIALIZED).
+static bool SetupMinifilterRegistry() {
+    HKEY hSvc = nullptr;
+    LONG rc = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\Winternal",
+        0, KEY_SET_VALUE | KEY_CREATE_SUB_KEY, &hSvc);
+    if (rc != ERROR_SUCCESS) return false;
+
+    static const wchar_t kDeps[]     = L"FltMgr\0";          // double-NUL terminated
+    static const wchar_t kDefaultI[] = L"WinternalDefault";
+    // Activity Monitor group (320000-329999) is far less crowded than the
+    // Anti-Virus range. Defender et al. live around 328010-329980; we pick
+    // 320200 which is unassigned in the public Microsoft altitude list.
+    static const wchar_t kAltitude[] = L"320200";
+    DWORD flags = 0;
+
+    ::RegSetValueExW(hSvc, L"DependOnService", 0, REG_MULTI_SZ,
+                     (const BYTE*)kDeps, sizeof(kDeps));
+
+    HKEY hInstances = nullptr;
+    rc = ::RegCreateKeyExW(hSvc, L"Instances", 0, nullptr, REG_OPTION_NON_VOLATILE,
+                           KEY_SET_VALUE | KEY_CREATE_SUB_KEY, nullptr, &hInstances, nullptr);
+    if (rc != ERROR_SUCCESS) { ::RegCloseKey(hSvc); return false; }
+    ::RegSetValueExW(hInstances, L"DefaultInstance", 0, REG_SZ,
+                     (const BYTE*)kDefaultI, sizeof(kDefaultI));
+
+    HKEY hDef = nullptr;
+    rc = ::RegCreateKeyExW(hInstances, kDefaultI, 0, nullptr, REG_OPTION_NON_VOLATILE,
+                           KEY_SET_VALUE, nullptr, &hDef, nullptr);
+    if (rc == ERROR_SUCCESS) {
+        ::RegSetValueExW(hDef, L"Altitude", 0, REG_SZ,
+                         (const BYTE*)kAltitude, sizeof(kAltitude));
+        ::RegSetValueExW(hDef, L"Flags", 0, REG_DWORD,
+                         (const BYTE*)&flags, sizeof(flags));
+        ::RegCloseKey(hDef);
+    }
+    ::RegCloseKey(hInstances);
+    ::RegCloseKey(hSvc);
+    return true;
+}
+
 int CmdInstall(int argc, wchar_t** argv) {
     if (!IsAdmin()) {
         fwprintf(stderr, L"install: requires an elevated prompt (right-click -> Run as administrator).\n");
@@ -150,10 +200,14 @@ int CmdInstall(int argc, wchar_t** argv) {
         }
     }
     if (!svc) {
+        // SERVICE_FILE_SYSTEM_DRIVER (Type=2) is the canonical type for
+        // minifilter drivers — FltMgr is happier with this even though
+        // Type=1 also works on modern Windows as long as the Instances
+        // registry is populated.
         svc = ::CreateServiceW(
             scm, kServiceName, kDisplayName,
             SERVICE_ALL_ACCESS,
-            SERVICE_KERNEL_DRIVER,
+            SERVICE_FILE_SYSTEM_DRIVER,
             SERVICE_DEMAND_START,
             SERVICE_ERROR_NORMAL,
             dst.c_str(),
@@ -178,11 +232,23 @@ int CmdInstall(int argc, wchar_t** argv) {
         wprintf(L"Created service '%s'.\n", kServiceName);
     } else {
         // Update existing service binary path in case --path moved.
-        if (!::ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+        // Upgrade existing service to SERVICE_FILE_SYSTEM_DRIVER if it
+        // was created earlier as Type=1. Required for the minifilter to
+        // attach reliably under modern FltMgr.
+        if (!::ChangeServiceConfigW(svc, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
                                     dst.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
             fwprintf(stderr, L"install: ChangeServiceConfig failed (%lu) — proceeding anyway.\n", ::GetLastError());
         }
         wprintf(L"Service '%s' already present — reused.\n", kServiceName);
+    }
+
+    // Minifilter registry plumbing — required for FltRegisterFilter to
+    // succeed when `ntfs filter add` engages the filter. Idempotent;
+    // safe to re-run.
+    if (!SetupMinifilterRegistry()) {
+        fwprintf(stderr, L"install: minifilter registry setup failed (%lu) — "
+                         L"`ntfs filter` may return STATUS_FLT_NOT_INITIALIZED.\n",
+                 ::GetLastError());
     }
 
     if (autoStart) {
@@ -382,6 +448,77 @@ int CmdSelftest() {
         if (!lua2 || lua2->luaStatus != 0)
             return fail(L"wnk.ntfs_usn_query", "kernel-Lua binding round-trip failed");
         wprintf(L"  [ok ] wnk.ntfs_usn_query (lua binding)\n");
+
+        // ---- NTFS filter end-to-end test ----
+        // Create a temp file, install a DENY rule for its full NT path,
+        // assert CreateFile fails with ACCESS_DENIED, remove the rule,
+        // assert CreateFile succeeds, and clean up. Exercises the live
+        // NtCreateFile hook all the way through the path-match logic.
+        {
+            wchar_t tmpDir[MAX_PATH];
+            ::GetTempPathW(MAX_PATH, tmpDir);
+            wchar_t tmpFile[MAX_PATH];
+            UINT n = ::GetTempFileNameW(tmpDir, L"wst", 0, tmpFile);
+            if (!n) return fail(L"NTFS_FILTER setup", "GetTempFileName failed");
+
+            // Make sure the file is closed so re-opening is what the test
+            // measures (GetTempFileName creates an empty file already).
+            // Pattern: `*<basename>`. The minifilter sees the normalized
+            // path `\Device\HarddiskVolumeN\Users\…\wstXXXX.tmp`, and `*`
+            // greedy-consumes everything before the literal basename.
+            // We deliberately don't insert `\` after `*` — FsRtlIsName-
+            // InExpression's `*` behavior across path separators is
+            // finicky; `*<basename>` is the portable form.
+            std::wstring base = std::wstring(L"*") +
+                                std::filesystem::path(tmpFile).filename().wstring();
+
+            auto id = ds.ntfsFilterAdd(base, DriverSession::FilterAction::Deny);
+            if (!id) return fail(L"NTFS_FILTER_ADD", "could not install rule");
+
+            HANDLE h = ::CreateFileW(tmpFile, GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, 0, nullptr);
+            DWORD blockedErr = (h == INVALID_HANDLE_VALUE) ? ::GetLastError() : 0;
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            if (blockedErr != ERROR_ACCESS_DENIED) {
+                ds.ntfsFilterRemove(*id);
+                ::DeleteFileW(tmpFile);
+                wchar_t why[160];
+                swprintf_s(why, L"open of %ls with DENY rule live; err=%lu (expected 5)",
+                           tmpFile, blockedErr);
+                ::SetLastError(blockedErr);
+                char whyA[160];
+                size_t n2 = 0; wcstombs_s(&n2, whyA, why, _TRUNCATE);
+                return fail(L"NTFS_FILTER block path", whyA);
+            }
+            wprintf(L"  [ok ] NTFS_FILTER rule %u blocks CreateFile (err 5)\n", *id);
+
+            // Remove the rule and confirm CreateFile works again.
+            if (!ds.ntfsFilterRemove(*id))
+                return fail(L"NTFS_FILTER_REMOVE", "could not remove rule");
+
+            h = ::CreateFileW(tmpFile, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                DWORD postErr = ::GetLastError();
+                ::DeleteFileW(tmpFile);
+                ::SetLastError(postErr);
+                return fail(L"NTFS_FILTER passthrough", "open still failed after remove");
+            }
+            ::CloseHandle(h);
+            wprintf(L"  [ok ] NTFS_FILTER_REMOVE restores access\n");
+
+            // Final list assertion — rule list should be empty (we just
+            // removed our one rule, no others were present).
+            auto rules = ds.ntfsFilterList();
+            if (!rules.empty())
+                fwprintf(stderr, L"  [warn] NTFS_FILTER_LIST: %zu leftover rules\n", rules.size());
+            else
+                wprintf(L"  [ok ] NTFS_FILTER_LIST is empty post-cleanup\n");
+
+            ::DeleteFileW(tmpFile);
+        }
     }
 
     wprintf(L"\nselftest: all checks passed.\n");

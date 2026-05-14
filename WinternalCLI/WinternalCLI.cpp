@@ -141,11 +141,15 @@ void PrintHelp() {
     app.subcommand(under(L"ntfs-vols",    L"ntfs vols",                          L"list NTFS volumes + metadata", H_NTFS));
     app.subcommand(under(L"ntfs-usn",     L"ntfs usn <vol> [--count N] [--start U] [--tail]",
                                           L"USN journal snapshot or live tail (rootkit-resistant)", H_NTFS));
+    app.subcommand(under(L"ntfs-monitor", L"ntfs monitor <vol> [--reasons LIST] [--filter S] [--paths]",
+                                          L"live activity stream — driver-blocking USN tail with colorized output", H_NTFS));
     app.subcommand(under(L"ntfs-mft",     L"ntfs mft <vol> [--limit N] [--name SUBSTR]",
                                           L"MFT walk via FSCTL_ENUM_USN_DATA (bypasses UM dir hooks)", H_NTFS));
     app.subcommand(under(L"ntfs-streams", L"ntfs streams <path>",                 L"list alternate data streams (ADS)", H_NTFS));
     app.subcommand(under(L"ntfs-compare", L"ntfs compare <path>",                 L"FindFirstFile vs MFT diff (hide detection)", H_NTFS));
     app.subcommand(under(L"ntfs-raw",     L"ntfs raw <device> <off> <len>",       L"driver-backed raw device read (bypasses minifilters)", H_NTFS));
+    app.subcommand(under(L"ntfs-filter",  L"ntfs filter <add|list|remove|clear>",
+                                          L"block/redirect file opens via kernel NtCreateFile hook + pattern rules", H_NTFS));
 
     // Service management.
     app.subcommand(under(L"install",   L"install [--path SYS] [--no-start]", L"copy + register Winternal.sys (starts by default)", H_SVC));

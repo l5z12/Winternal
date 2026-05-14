@@ -43,6 +43,10 @@ Environment:
 #include <ntimage.h>
 #include <intrin.h>
 #include <bcrypt.h>     // SHA-256 via cng.lib (added in Winternal.vcxproj)
+// fltKernel.h is NOT included here — it conflicts with ntddk.h that the
+// KMDF stack pulls in via driver.h. The minifilter code lives in
+// FltFilter.c (its own TU), and we bridge to it via the extern helpers
+// declared below.
 
 // SeLocateProcessImageName forward decl — exported by ntoskrnl on Win7+
 // but the WDK doesn't always pick it up via the default ntddk.h chain.
@@ -1101,14 +1105,19 @@ static NTSTATUS WinternalProtectWriteCode(PVOID Target, const VOID* Src, SIZE_T 
     // the right call vs. hanging the system. SMP coherence — other CPUs
     // see their own CR0, this only affects ours.
     NTSTATUS status = STATUS_SUCCESS;
-    ULONG_PTR cr0 = __readcr0();
-    __writecr0(cr0 & ~0x10000ULL);              // clear WP (bit 16) on this CPU
+    // Wrap the ENTIRE CR0 sequence — not just the RtlCopyMemory — because
+    // Hyper-V/VBS intercepts the `mov cr0, ...` instruction itself and
+    // injects a #GP (STATUS_PRIVILEGED_INSTRUCTION) when VBS is enforcing
+    // EPT write-protection of kernel code pages. An __try around only the
+    // RtlCopyMemory lets that fault escape unhandled to the dispatcher.
     __try {
+        ULONG_PTR cr0 = __readcr0();
+        __writecr0(cr0 & ~0x10000ULL);          // clear WP (bit 16) on this CPU
         RtlCopyMemory(Target, Src, Length);
+        __writecr0(cr0);                         // restore
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
-    __writecr0(cr0);                             // restore
 
     if (NT_SUCCESS(status)) {
         // HVCI may swallow the write silently; verify by reading back.
@@ -1159,7 +1168,14 @@ static NTSTATUS WinternalInstallObUnregHook(VOID)
         return status;
     }
 
-    status = WinternalProtectWriteCode(target, newProlog, prolog);
+    // Defensive __try: WinternalProtectWriteCode toggles CR0.WP which can
+    // raise an SEH-bypassing fault on HVCI hosts despite its own internal
+    // try/except.
+    __try {
+        status = WinternalProtectWriteCode(target, newProlog, prolog);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
     if (!NT_SUCCESS(status)) {
         // HVCI / EPT blocked the write. Nothing else to try without going
         // deeper (PT remap, hypervisor exit) — bail with the original
@@ -1282,7 +1298,12 @@ static NTSTATUS WinternalInstallNtUnloadHook(VOID)
         return status;
     }
 
-    status = WinternalProtectWriteCode(target, newProlog, prolog);
+    // Same defensive SEH wrap as the ObUnreg and NtCreateFile installers.
+    __try {
+        status = WinternalProtectWriteCode(target, newProlog, prolog);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
         return status;
@@ -1307,6 +1328,236 @@ static VOID WinternalUninstallNtUnloadHook(VOID)
     g_NtUnloadOriginal      = NULL;
     g_NtUnloadPrologSize    = 0;
     g_NtUnloadHookInstalled = FALSE;
+}
+
+// -----------------------------------------------------------------------------
+// NTFS filter: NtCreateFile hook + rule list. Patterns use Windows DOS-style
+// wildcards via FsRtlIsNameInExpression — the same matcher NTFS uses for its
+// own name comparisons. First-match-wins evaluation.
+// -----------------------------------------------------------------------------
+typedef struct _WN_FILTER_RULE_LIVE {
+    UINT32 RuleId;
+    UINT32 Action;
+    UINT32 MatchCount;
+    WCHAR  Pattern[WINTERNAL_FILTER_PATTERN_MAX];
+    USHORT PatternLen;       // in WCHARs, excluding NUL
+} WN_FILTER_RULE_LIVE;
+
+static WN_FILTER_RULE_LIVE g_FilterRules[WINTERNAL_FILTER_MAX_RULES];
+static ULONG    g_FilterCount    = 0;
+static UINT32   g_FilterNextId   = 1;
+static KSPIN_LOCK g_FilterSpin;
+static BOOLEAN    g_FilterSpinInit = FALSE;
+
+// Path-aware wildcard matcher. `FsRtlIsNameInExpression` looks like the
+// natural choice but the docs are explicit that it operates on *single
+// name components* — `*` won't span `\`, so a pattern like `*\foo.txt`
+// or `*foo.txt` against `\Device\HDV3\path\foo.txt` doesn't match.
+// This iterative two-pointer matcher does what users actually expect
+// from shell wildcards: `*` matches ANY sequence including separators,
+// `?` matches exactly one character. Case-insensitive (file-system
+// semantics). Length-bounded — patterns and names aren't NUL-terminated
+// in general when they come from UNICODE_STRINGs.
+static BOOLEAN WinternalMatchWildcard(const WCHAR* pat, size_t plen,
+                                       const WCHAR* str, size_t slen)
+{
+    size_t pi = 0, si = 0;
+    size_t starPi = (size_t)-1, starSi = 0;
+    while (si < slen) {
+        if (pi < plen && pat[pi] == L'*') {
+            starPi = pi++;
+            starSi = si;
+            continue;
+        }
+        if (pi < plen) {
+            WCHAR p = pat[pi];
+            WCHAR s = str[si];
+            if (p >= L'A' && p <= L'Z') p += 32;
+            if (s >= L'A' && s <= L'Z') s += 32;
+            if (p == L'?' || p == s) {
+                ++pi; ++si;
+                continue;
+            }
+        }
+        if (starPi != (size_t)-1) {
+            pi = starPi + 1;
+            si = ++starSi;
+            continue;
+        }
+        return FALSE;
+    }
+    while (pi < plen && pat[pi] == L'*') ++pi;
+    return pi == plen;
+}
+
+// Minifilter Register/Unregister live in FltFilter.c (separate TU, only
+// includes fltKernel.h to avoid clashing with KMDF/ntddk.h here). The
+// pre-create callback in that TU asks us to evaluate the rule list via
+// the helper exported below.
+NTSTATUS WinternalFilterRegister(_In_ PDRIVER_OBJECT DriverObject);
+VOID     WinternalFilterUnregister(VOID);
+BOOLEAN  WinternalFilterIsActive(VOID);
+
+// Evaluate the rule list against `Name`. Returns the matching action
+// (WINTERNAL_FILTER_ACT_*) and writes the rule ID to `outRuleId`. If no
+// rule matches, returns (UINT32)-1. Called from the minifilter
+// pre-create callback in FltFilter.c.
+UINT32 WinternalFilterEvaluate(_In_ PUNICODE_STRING Name, _Out_ UINT32* outRuleId);
+
+UINT32 WinternalFilterEvaluate(_In_ PUNICODE_STRING Name, _Out_ UINT32* outRuleId)
+{
+    *outRuleId = 0;
+    if (g_FilterCount == 0 || !Name) return (UINT32)-1;
+
+    UINT32 action = (UINT32)-1;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_FilterSpin, &irql);
+    for (ULONG i = 0; i < g_FilterCount; ++i) {
+        UNICODE_STRING pat;
+        pat.Buffer        = g_FilterRules[i].Pattern;
+        pat.Length        = g_FilterRules[i].PatternLen * sizeof(WCHAR);
+        pat.MaximumLength = pat.Length;
+        BOOLEAN matched = WinternalMatchWildcard(
+            g_FilterRules[i].Pattern, g_FilterRules[i].PatternLen,
+            Name->Buffer,              Name->Length / sizeof(WCHAR));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[winternal] eval: pat='%wZ' vs name='%wZ' -> %s\n",
+                   &pat, Name, matched ? "MATCH" : "miss");
+        if (matched) {
+            g_FilterRules[i].MatchCount++;
+            action     = g_FilterRules[i].Action;
+            *outRuleId = g_FilterRules[i].RuleId;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_FilterSpin, irql);
+    return action;
+}
+
+// Audit-append shim. Inlined into FltFilter.c's PreCreate via this
+// extern. Avoids needing AuditAppend's prototype visible to the FLT TU.
+VOID WinternalFilterAudit(UINT32 ruleId, NTSTATUS action)
+{
+    AuditAppend(IOCTL_WINTERNAL_NTFS_FILTER_ADD, 0, ruleId, action);
+}
+
+// The minifilter is registered once at DriverEntry (see Driver.c) and
+// torn down once at WinternalProtectUnregister (driver unload). Rule
+// add/clear just mutates the rule list — the pre-create callback is
+// always live for the driver's lifetime, with an empty rule list as the
+// fast-path no-op.
+
+static NTSTATUS HandleNtfsFilterAdd(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_FILTER_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_FILTER_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_FILTER_RULE in = (PWINTERNAL_FILTER_RULE)InBuf;
+
+    // Validate pattern: NUL-terminated within bounds, non-empty.
+    USHORT plen = 0;
+    while (plen < WINTERNAL_FILTER_PATTERN_MAX && in->Pattern[plen]) ++plen;
+    if (plen == 0 || plen >= WINTERNAL_FILTER_PATTERN_MAX) return STATUS_INVALID_PARAMETER;
+    if (in->Action > WINTERNAL_FILTER_ACT_LOG) return STATUS_INVALID_PARAMETER;
+
+    if (!g_FilterSpinInit) { KeInitializeSpinLock(&g_FilterSpin); g_FilterSpinInit = TRUE; }
+
+    // The minifilter is registered at DriverEntry — if it isn't active
+    // by the time the first rule comes in, attachment didn't happen
+    // (typically because Services\Winternal\Instances wasn't populated
+    // at install time, or the driver was loaded before FltMgr). Fail
+    // loud so the operator knows to reinstall rather than silently
+    // storing rules that won't fire.
+    if (!WinternalFilterIsActive()) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] NTFS_FILTER_ADD: minifilter not active — "
+                   "did FltRegisterFilter fail at DriverEntry? Reinstall.\n");
+        return STATUS_FLT_NOT_INITIALIZED;
+    }
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_FilterSpin, &irql);
+    if (g_FilterCount >= WINTERNAL_FILTER_MAX_RULES) {
+        KeReleaseSpinLock(&g_FilterSpin, irql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    WN_FILTER_RULE_LIVE* r = &g_FilterRules[g_FilterCount];
+    r->RuleId     = g_FilterNextId++;
+    r->Action     = in->Action;
+    r->MatchCount = 0;
+    RtlCopyMemory(r->Pattern, in->Pattern, plen * sizeof(WCHAR));
+    r->Pattern[plen] = 0;
+    r->PatternLen = plen;
+    UINT32 assignedId = r->RuleId;
+    ++g_FilterCount;
+    KeReleaseSpinLock(&g_FilterSpin, irql);
+
+    PWINTERNAL_FILTER_RULE out = (PWINTERNAL_FILTER_RULE)OutBuf;
+    RtlCopyMemory(out, in, sizeof(*out));
+    out->RuleId = assignedId;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleNtfsFilterRemove(PVOID InBuf, size_t InLen)
+{
+    if (InLen < sizeof(WINTERNAL_FILTER_REMOVE_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_FILTER_REMOVE_IN in = (PWINTERNAL_FILTER_REMOVE_IN)InBuf;
+    if (!g_FilterSpinInit) return STATUS_NOT_FOUND;
+
+    BOOLEAN removed = FALSE;
+    ULONG   newCount;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_FilterSpin, &irql);
+    for (ULONG i = 0; i < g_FilterCount; ++i) {
+        if (g_FilterRules[i].RuleId == in->RuleId) {
+            for (ULONG j = i; j + 1 < g_FilterCount; ++j) g_FilterRules[j] = g_FilterRules[j + 1];
+            --g_FilterCount;
+            removed = TRUE;
+            break;
+        }
+    }
+    newCount = g_FilterCount;
+    KeReleaseSpinLock(&g_FilterSpin, irql);
+
+    if (!removed) return STATUS_NOT_FOUND;
+    (void)newCount;  // minifilter stays registered for driver lifetime
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleNtfsFilterList(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_FILTER_LIST_OUT, Rules);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_FILTER_LIST_OUT out = (PWINTERNAL_FILTER_LIST_OUT)OutBuf;
+    ULONG maxRules = (ULONG)((OutLen - header) / sizeof(WINTERNAL_FILTER_RULE));
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_FilterSpin, &irql);
+    ULONG toReturn = g_FilterCount < maxRules ? g_FilterCount : maxRules;
+    for (ULONG i = 0; i < toReturn; ++i) {
+        out->Rules[i].RuleId     = g_FilterRules[i].RuleId;
+        out->Rules[i].Action     = g_FilterRules[i].Action;
+        out->Rules[i].MatchCount = g_FilterRules[i].MatchCount;
+        out->Rules[i].Reserved   = 0;
+        RtlCopyMemory(out->Rules[i].Pattern, g_FilterRules[i].Pattern,
+                      (g_FilterRules[i].PatternLen + 1) * sizeof(WCHAR));
+    }
+    out->Count    = toReturn;
+    out->Reserved = 0;
+    KeReleaseSpinLock(&g_FilterSpin, irql);
+
+    *Written = header + toReturn * sizeof(WINTERNAL_FILTER_RULE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleNtfsFilterClear(VOID)
+{
+    if (!g_FilterSpinInit) return STATUS_SUCCESS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_FilterSpin, &irql);
+    g_FilterCount = 0;
+    KeReleaseSpinLock(&g_FilterSpin, irql);
+    return STATUS_SUCCESS;
 }
 
 // Lazy one-time registration. Altitude string is in the "free" altitude
@@ -1361,8 +1612,10 @@ VOID WinternalProtectUnregister(VOID)
 {
     // Order matters: pull our hook off ObUnRegisterCallbacks BEFORE calling
     // it ourselves, or we'd silently no-op our own cleanup. Also pull the
-    // NtUnloadDriver hook — if we unload while it's still installed, the
-    // jmp lands in freed pool and the next sc stop bug-checks the system.
+    // syscall hook + minifilter — leaving them live across driver unload
+    // would land the next caller in freed pool (jmp) or freed FLT_FILTER
+    // (FltMgr) and bug-check the system.
+    WinternalFilterUnregister();
     WinternalUninstallNtUnloadHook();
     WinternalUninstallObUnregHook();
 
@@ -2472,6 +2725,10 @@ static NTSTATUS HandleNtfsUsnQuery(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleNtfsUsnRead(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleNtfsMftEnum(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleNtfsStreams(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsFilterAdd(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsFilterRemove(PVOID, size_t);
+static NTSTATUS HandleNtfsFilterList(PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsFilterClear(VOID);
 static NTSTATUS HandleForceUnload(PVOID, size_t);
 static NTSTATUS HandleKdrvRegister(PVOID, size_t);
 static NTSTATUS HandleKdrvDeregister(PVOID, size_t);
@@ -4146,6 +4403,18 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
         break;
     case IOCTL_WINTERNAL_NTFS_STREAMS:
         status = HandleNtfsStreams(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_FILTER_ADD:
+        status = HandleNtfsFilterAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_FILTER_REMOVE:
+        status = HandleNtfsFilterRemove(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_NTFS_FILTER_LIST:
+        status = HandleNtfsFilterList(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_FILTER_CLEAR:
+        status = HandleNtfsFilterClear();
         break;
     case IOCTL_WINTERNAL_SELFPROTECT_SET:
         status = HandleSelfProtectSet(InBuf, InLen);

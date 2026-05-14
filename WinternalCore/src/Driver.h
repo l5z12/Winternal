@@ -248,6 +248,22 @@ public:
     std::optional<std::vector<uint8_t>>
         ntfsStreams(std::wstring_view ntPath);
 
+    // NTFS filter rule management. Patterns are RtlIsNameInExpression-style
+    // DOS wildcards (`*`, `?`, `<`, `>`, `"`). Actions: 0=deny, 1=notfound,
+    // 2=readonly, 3=log. First-match-wins; max 64 rules.
+    struct FilterRule {
+        uint32_t ruleId;
+        uint32_t action;
+        uint32_t matchCount;
+        std::wstring pattern;
+    };
+    enum class FilterAction { Deny = 0, NotFound = 1, ReadOnly = 2, Log = 3 };
+
+    std::optional<uint32_t> ntfsFilterAdd(std::wstring_view pattern, FilterAction action);
+    bool                    ntfsFilterRemove(uint32_t ruleId);
+    bool                    ntfsFilterClear();
+    std::vector<FilterRule> ntfsFilterList();
+
     // Self-protection. When engaged, the driver auto-adds `ownerPid` to
     // the Ob protect list and refuses any IOCTL that would weaken
     // protection (disengage, unprotect of owner, force-unload Winternal,

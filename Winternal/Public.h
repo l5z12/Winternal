@@ -469,6 +469,55 @@ typedef struct _WINTERNAL_NTFS_STREAMS_IN {
     WCHAR Path[WINTERNAL_NTFS_PATH_MAX];   // NT path like L"\\??\\C:\\Users\\..."
 } WINTERNAL_NTFS_STREAMS_IN, *PWINTERNAL_NTFS_STREAMS_IN;
 
+// ---- NTFS filter (NtCreateFile hook + rule list) ----
+//
+// Each rule is { pattern, action }. Patterns use Windows wildcard syntax
+// (RtlIsNameInExpression): `*` any chars, `?` one char, `<` `>` `"`
+// FSD-specific wildcards. The driver intercepts NtCreateFile, walks rules
+// in insertion order, and applies the first-match action. Hook is
+// installed lazily on first ADD and uninstalled on CLEAR / when the last
+// rule is removed.
+//
+// Actions:
+//   DENY      -> STATUS_ACCESS_DENIED
+//   NOTFOUND  -> STATUS_OBJECT_NAME_NOT_FOUND  (file appears not to exist)
+//   READONLY  -> strip GENERIC_WRITE/FILE_WRITE_DATA from DesiredAccess
+//                (so the open succeeds but writes fail; useful for sealing
+//                 specific files without breaking processes that just want
+//                 to read them).
+//   LOG       -> log to audit ring, allow through (instrumentation only).
+#define IOCTL_WINTERNAL_NTFS_FILTER_ADD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x886, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_FILTER_REMOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x887, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_FILTER_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x888, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_FILTER_CLEAR  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x889, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_FILTER_MAX_RULES    64
+#define WINTERNAL_FILTER_PATTERN_MAX 260
+
+#define WINTERNAL_FILTER_ACT_DENY     0
+#define WINTERNAL_FILTER_ACT_NOTFOUND 1
+#define WINTERNAL_FILTER_ACT_READONLY 2
+#define WINTERNAL_FILTER_ACT_LOG      3
+
+typedef struct _WINTERNAL_FILTER_RULE {
+    UINT32 RuleId;                                       // 0 on ADD; assigned by driver
+    UINT32 Action;                                       // WINTERNAL_FILTER_ACT_*
+    UINT32 MatchCount;                                   // populated on LIST
+    UINT32 Reserved;
+    WCHAR  Pattern[WINTERNAL_FILTER_PATTERN_MAX];        // RtlIsNameInExpression syntax
+} WINTERNAL_FILTER_RULE, *PWINTERNAL_FILTER_RULE;
+
+typedef struct _WINTERNAL_FILTER_REMOVE_IN {
+    UINT32 RuleId;
+    UINT32 Reserved;
+} WINTERNAL_FILTER_REMOVE_IN, *PWINTERNAL_FILTER_REMOVE_IN;
+
+typedef struct _WINTERNAL_FILTER_LIST_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_FILTER_RULE Rules[1];                      // [Count]
+} WINTERNAL_FILTER_LIST_OUT, *PWINTERNAL_FILTER_LIST_OUT;
+
 typedef struct _WINTERNAL_SIGLEVEL_IN {
     UINT32 Pid;
     UINT8  SignatureLevel;       // SE_SIGNING_LEVEL_*
