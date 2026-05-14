@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="Winternal/Winternal.vcxproj">
+    <Deploy />
+  </Project>
+  <Project Path="WinternalCLI/WinternalCLI.vcxproj" Id="111de2a4-99f2-42b1-ba00-5fa8374236de" />
+  <Project Path="WinternalCore/WinternalCore.vcxproj" Id="a1b2c3d4-1111-4222-9333-abcdef000001" />
+</Solution>

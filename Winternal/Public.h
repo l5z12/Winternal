@@ -1,0 +1,656 @@
+/*++
+
+Module Name:
+
+    public.h
+
+Abstract:
+
+    Common declarations shared by the Winternal driver and user-mode clients.
+
+    The driver exposes a small "kernel scripting" surface that lets user-mode
+    callers read/write arbitrary kernel virtual memory, resolve exports,
+    allocate pool, and invoke kernel routines. Higher-level helpers
+    (process unprotect/kill, callback enumeration, SSDT/driver list) are
+    layered on top of those primitives for convenience and so that user
+    code can stay portable across builds. The intent is research and
+    rootkit-detection on a VM — see README.
+
+Environment:
+
+    user and kernel
+
+--*/
+
+#pragma once
+
+//
+// Device interface GUID and symbolic link name. Apps may either:
+//   1) Use SetupDi to find the device interface, OR
+//   2) CreateFile(L"\\\\.\\Winternal", ...) which goes through the symlink
+//      created by the driver in DriverEntry.
+//
+DEFINE_GUID (GUID_DEVINTERFACE_Winternal,
+    0xfa6d6eff,0xf155,0x4ada,0xb9,0xd6,0xa2,0x4b,0x5d,0x40,0x7e,0x1c);
+// {fa6d6eff-f155-4ada-b9d6-a24b5d407e1c}
+
+#define WINTERNAL_DEVICE_NAME       L"\\Device\\Winternal"
+#define WINTERNAL_SYMLINK_NAME      L"\\DosDevices\\Winternal"   // -> \\.\Winternal
+#define WINTERNAL_USER_OPEN_PATH    L"\\\\.\\Winternal"
+
+//
+// SDDL restricting CreateFile() on the device to SYSTEM and Administrators
+// only. The kernel resolves this at AddDevice time, so unprivileged callers
+// fail at open before any IOCTL plumbing runs.
+//
+#define WINTERNAL_DEVICE_SDDL       L"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+#ifndef CTL_CODE
+#include <winioctl.h>
+#endif
+
+//
+// IOCTL codes. Function codes 0x800-0xFFF are reserved for vendor use.
+// METHOD_BUFFERED keeps probing/locking off the fast path. Per-IOCTL caps
+// (see WINTERNAL_KMEM_MAX_BYTES) limit the worst-case allocation.
+//
+#define IOCTL_WINTERNAL_GET_VERSION       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_ENUM_PIDS         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Raw kernel memory (the "engine" — everything else can be built on these).
+#define IOCTL_WINTERNAL_KMEM_READ         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KMEM_WRITE        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KSYM              CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KALLOC            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KFREE             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KCALL             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Process control.
+#define IOCTL_WINTERNAL_UNPROTECT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KILL_PROCESS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Force-protect: registers an Ob* pre-operation callback that strips
+// destructive (and optionally informational) access bits when any caller
+// opens a handle to the target PID. Survives until the driver unloads.
+#define IOCTL_WINTERNAL_PROTECT_LOCK   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROTECT_UNLOCK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROTECT_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Flip the TOKEN_HAS_UI_ACCESS bit of a target process's primary token.
+// User-mode SetTokenInformation(TokenUIAccess) demands SeTcbPrivilege and
+// even with it can't enable UIAccess on a running process (NtSetInfoToken
+// rejects the request). From kernel we just write the byte. Lifts the
+// CreateWindowInBand / SetWindowBand restrictions on bands >= UIACCESS.
+#define IOCTL_WINTERNAL_TOKEN_UIACCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Rootkit detection helpers.
+#define IOCTL_WINTERNAL_ENUM_CALLBACKS    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x830, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_ENUM_DRIVERS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x831, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_ENUM_SSDT         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x832, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Kernel-mode inline hooks. Detour must be a kernel address (typically a
+// buffer allocated via KALLOC and populated with shellcode via KMEM_WRITE).
+// On unload, the driver uninstalls everything still installed — otherwise a
+// dangling JMP into freed pool would bug-check on next call.
+//
+// PatchGuard (KPP) will detect hooks on most ntoskrnl / SSDT targets and
+// bug-check the system within ~30 minutes. Test on a VM with HVCI/VBS off.
+#define IOCTL_WINTERNAL_KHOOK_INSTALL     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x840, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KHOOK_UNINSTALL   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x841, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KHOOK_UNINSTALL_ALL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x842, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Kernel-mode Lua execution. Input is a UTF-8 Lua script; output is a
+// captured stdout-like buffer (everything the script's print() emits) plus
+// the Lua status code. The script runs with a `wnk` table exposing direct
+// kernel primitives (ksym, kread, kwrite, kcall, pids, etc.).
+#define IOCTL_WINTERNAL_LUA_EXEC          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x850, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Lockdown — once set, the driver refuses every write/patch IOCTL
+// (kwrite, kalloc, kfree, kcall, unprotect, kill, khook*, lua_exec).
+// One-way intentionally: the bit clears only on driver unload. Caller
+// uses this after disabling PG so a buggy script can't worsen things.
+#define IOCTL_WINTERNAL_LOCKDOWN_ENGAGE   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x860, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_LOCKDOWN_STATUS   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x861, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Force-unload another kernel driver by name. Resolves \Driver\<name> via
+// ObReferenceObjectByName, then calls its DriverUnload routine directly.
+// Bypasses SCM entirely so it works on drivers that don't accept
+// SERVICE_ACCEPT_STOP. Dangerous: the target may have outstanding IRPs,
+// callbacks, or timers it expected PnP to drain first.
+#define IOCTL_WINTERNAL_FORCE_UNLOAD_DRIVER CTL_CODE(FILE_DEVICE_UNKNOWN, 0x870, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Kernel-level driver management — uses ZwLoadDriver / ZwUnloadDriver and
+// direct registry manipulation (ZwCreateKey/ZwSetValueKey/ZwDeleteKey).
+// Bypasses SCM entirely; signing requirements are NOT bypassed — the
+// kernel loader still validates signatures when DSE is enforcing.
+#define IOCTL_WINTERNAL_KDRV_REGISTER     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x871, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KDRV_LOAD         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x872, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KDRV_UNLOAD       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x873, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KDRV_DEREGISTER   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x874, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_KDRV_SET_START    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x875, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Audit log — every privileged IOCTL records a row. Caller reads up to
+// the last N rows. Useful for forensic review after a session.
+#define IOCTL_WINTERNAL_AUDIT_TAIL        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x862, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define WINTERNAL_AUDIT_MAX_ROWS          1024
+
+// Per-call cap for kernel R/W. METHOD_BUFFERED allocates a single non-paged
+// buffer of this size, so keep it modest. Scripts that need more should chunk.
+#define WINTERNAL_KMEM_MAX_BYTES          (1u * 1024u * 1024u)
+
+//
+// ---- Version ----
+//
+typedef struct _WINTERNAL_VERSION {
+    UINT32 Major;
+    UINT32 Minor;
+    UINT32 BuildTime;       // unix-ish, populated by driver
+    UINT32 Reserved;
+} WINTERNAL_VERSION, *PWINTERNAL_VERSION;
+
+//
+// ---- PID enumeration (DKOM cross-check) ----
+//
+typedef struct _WINTERNAL_PID_ENTRY {
+    UINT32  Pid;
+    UINT32  ParentPid;        // best-effort, may be 0 on platforms where unavailable
+    CHAR    ImageFileName[16];
+} WINTERNAL_PID_ENTRY, *PWINTERNAL_PID_ENTRY;
+
+typedef struct _WINTERNAL_PID_LIST {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_PID_ENTRY Entries[1];
+} WINTERNAL_PID_LIST, *PWINTERNAL_PID_LIST;
+
+//
+// ---- Kernel R/W ----
+//
+// READ:   in  = {Address, Length};   out = raw bytes (Length bytes on success)
+// WRITE:  in  = {Address, Length, Data[Length]};   out = (none)
+//
+typedef struct _WINTERNAL_KMEM_READ_IN {
+    UINT64 Address;
+    UINT32 Length;
+    UINT32 Reserved;
+} WINTERNAL_KMEM_READ_IN, *PWINTERNAL_KMEM_READ_IN;
+
+typedef struct _WINTERNAL_KMEM_WRITE_IN {
+    UINT64 Address;
+    UINT32 Length;
+    UINT32 Reserved;
+    UCHAR  Data[1];        // Length bytes
+} WINTERNAL_KMEM_WRITE_IN, *PWINTERNAL_KMEM_WRITE_IN;
+
+//
+// ---- Symbol lookup (ntoskrnl exports + already-loaded kernel modules) ----
+//
+typedef struct _WINTERNAL_KSYM_IN {
+    WCHAR  Name[64];       // NUL-terminated. ntoskrnl-exported routine name.
+} WINTERNAL_KSYM_IN, *PWINTERNAL_KSYM_IN;
+
+typedef struct _WINTERNAL_KSYM_OUT {
+    UINT64 Address;        // 0 if not found
+} WINTERNAL_KSYM_OUT, *PWINTERNAL_KSYM_OUT;
+
+//
+// ---- Pool alloc / free ----
+//
+typedef struct _WINTERNAL_KALLOC_IN {
+    UINT32 Length;
+    UINT32 Tag;            // 4-char ASCII tag, e.g. 'WnTl'
+    UINT32 NonPaged;       // 0 = paged, 1 = non-paged
+    UINT32 Reserved;
+} WINTERNAL_KALLOC_IN, *PWINTERNAL_KALLOC_IN;
+
+typedef struct _WINTERNAL_KALLOC_OUT {
+    UINT64 Address;
+} WINTERNAL_KALLOC_OUT, *PWINTERNAL_KALLOC_OUT;
+
+typedef struct _WINTERNAL_KFREE_IN {
+    UINT64 Address;
+    UINT32 Tag;            // must match the alloc tag (or 0 for "ignore")
+    UINT32 Reserved;
+} WINTERNAL_KFREE_IN, *PWINTERNAL_KFREE_IN;
+
+//
+// ---- Kernel function call ----
+//
+// Calls (PVOID(*)(ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR))Address(a1, a2, a3, a4)
+// at IRQL == PASSIVE_LEVEL inside the dispatch thread. The caller is
+// responsible for argument validity; the driver wraps the call in SEH so a
+// crashing target is reported as STATUS_UNSUCCESSFUL rather than bug-checking
+// the queue thread (it can still bug-check the system if the target touches
+// invalid memory at high IRQL).
+//
+typedef struct _WINTERNAL_KCALL_IN {
+    UINT64 Address;
+    UINT64 Args[4];
+} WINTERNAL_KCALL_IN, *PWINTERNAL_KCALL_IN;
+
+typedef struct _WINTERNAL_KCALL_OUT {
+    UINT64 ReturnValue;
+    UINT32 Faulted;        // non-zero if the call raised an SEH exception
+    UINT32 Reserved;
+} WINTERNAL_KCALL_OUT, *PWINTERNAL_KCALL_OUT;
+
+//
+// ---- Process unprotect ----
+//
+// Win11 24H2 (build 26100) puts EPROCESS->Protection at a known offset.
+// Because that offset changes per build, callers may either:
+//   * pass FieldOffset = 0 to use the driver's compiled-in default, OR
+//   * pass an explicit FieldOffset and NewValue they discovered themselves
+//     via kread/ksym (the "scripts can do everything" path).
+//
+typedef struct _WINTERNAL_UNPROTECT_IN {
+    UINT32 Pid;
+    UINT32 FieldOffset;    // 0 -> use driver default for current build
+    UINT8  NewValue;       // typically 0 to clear PP/PPL
+    UINT8  Reserved[7];
+} WINTERNAL_UNPROTECT_IN, *PWINTERNAL_UNPROTECT_IN;
+
+typedef struct _WINTERNAL_UNPROTECT_OUT {
+    UINT32 FieldOffsetUsed;
+    UINT8  PrevValue;
+    UINT8  Reserved[3];
+} WINTERNAL_UNPROTECT_OUT, *PWINTERNAL_UNPROTECT_OUT;
+
+//
+// ---- Kill (works on protected processes) ----
+//
+typedef struct _WINTERNAL_KILL_IN {
+    UINT32 Pid;
+    UINT32 ExitStatus;     // commonly 1 or STATUS_PROCESS_IS_TERMINATING
+} WINTERNAL_KILL_IN, *PWINTERNAL_KILL_IN;
+
+//
+// ---- Force-protect (Ob callback lockdown) ----
+//
+// Driver maintains a small array of locked PIDs. On the first PROTECT_LOCK
+// call it registers a single pair of pre-operation Ob callbacks (one for
+// PsProcessType, one for PsThreadType). Each callback walks the locked
+// list and, on match, ANDs the requested access mask with ~Strip — i.e.,
+// the requested bits in Strip are silently removed before the handle is
+// granted. Kernel-mode openers (Info->KernelHandle == TRUE) are skipped
+// so our own driver can still operate on locked PIDs.
+//
+// Cap is fixed (WINTERNAL_PROTECT_MAX) so the callback can do a linear
+// walk without taking a per-call allocation in the hot path.
+//
+#define WINTERNAL_PROTECT_MAX 32
+
+typedef struct _WINTERNAL_PROTECT_LOCK_IN {
+    UINT32 Pid;
+    UINT32 Reserved;
+} WINTERNAL_PROTECT_LOCK_IN, *PWINTERNAL_PROTECT_LOCK_IN;
+
+typedef struct _WINTERNAL_PROTECT_LIST_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    UINT32 Pids[WINTERNAL_PROTECT_MAX];
+} WINTERNAL_PROTECT_LIST_OUT, *PWINTERNAL_PROTECT_LIST_OUT;
+
+//
+// ---- Token UIAccess flip ----
+//
+// nt!_TOKEN has a TokenFlags ULONG with bit 0x10 = TOKEN_HAS_UI_ACCESS.
+// On Win11 24H2 (build 26100) the field is at offset 0x40 from the start
+// of the token object. Other builds may differ; caller can pass an
+// explicit FieldOffset, or leave 0 to use the driver default.
+//
+typedef struct _WINTERNAL_TOKEN_UIACCESS_IN {
+    UINT32 Pid;
+    UINT32 Enable;          // 0 = clear, 1 = set
+    UINT32 FieldOffset;     // 0 = driver default
+    UINT32 Reserved;
+} WINTERNAL_TOKEN_UIACCESS_IN, *PWINTERNAL_TOKEN_UIACCESS_IN;
+
+typedef struct _WINTERNAL_TOKEN_UIACCESS_OUT {
+    UINT32 PrevFlags;
+    UINT32 NewFlags;
+    UINT32 FieldOffsetUsed;
+    UINT32 Reserved;
+} WINTERNAL_TOKEN_UIACCESS_OUT, *PWINTERNAL_TOKEN_UIACCESS_OUT;
+
+#define WINTERNAL_TOKEN_FLAG_UIACCESS         0x10
+#define WINTERNAL_DEFAULT_TOKENFLAGS_OFFSET   0x40
+
+//
+// ---- EPROCESS signature level ----
+//
+// Win11 24H2 (build 26100) keeps SignatureLevel and SectionSignatureLevel
+// as two adjacent UCHARs at offset 0x878 / 0x879. win32k checks the value
+// for high z-bands (GENUINE_WINDOWS, SYSTEM_TOOLS, LOCK) and refuses the
+// SetWindowBand if the level isn't Microsoft-grade. Bumping the bytes to
+// SE_SIGNING_LEVEL_WINDOWS (0x0C) makes the process appear MS-signed for
+// the win32k check.
+//
+#define IOCTL_WINTERNAL_SET_SIGLEVEL  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Write into kernel CODE pages — toggles CR0.WP on the current CPU before
+// the copy and reads back to detect HVCI silent rejection. Used for inline
+// patches of system DLLs / drivers (e.g. neutering win32kfull's
+// IAMThreadAccessGranted + IsValidBandForProcess gates for `win zbid`).
+// Read-back verification means the write either applies or returns
+// STATUS_NOT_SUPPORTED — no silent failures.
+#define IOCTL_WINTERNAL_KCODE_PATCH   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x827, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Returns the kernel address of a small "always returns 1" stub function
+// inside Winternal.sys. Used as the IAT redirect target for bypassing
+// win32k!IsImmersiveBroker (and any other bool-returning gate where we
+// can patch the IAT slot in .rdata instead of the function body in .text;
+// .text writes are blocked by HVCI, .rdata writes go through).
+#define IOCTL_WINTERNAL_GET_TRUE_STUB CTL_CODE(FILE_DEVICE_UNKNOWN, 0x828, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Returns the kernel address of EPROCESS->Win32Process (tagPROCESSINFO*)
+// for a given PID, via PsGetProcessWin32Process. The CLI then kread/kwrites
+// fields on it directly — pool memory, no HVCI / CR0.WP needed.
+#define IOCTL_WINTERNAL_GET_W32PROC   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x829, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Kernel-side equivalents of user-mode process inspection. Bypass any
+// user-mode API hooks (Detours/EAT/IAT) since the underlying syscalls
+// run with PreviousMode=KernelMode and the OS doesn't apply the user-mode
+// detours installed by AVs/anti-cheat.
+#define IOCTL_WINTERNAL_ENUM_THREADS   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_K_MITIGATIONS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_K_TOKEN_INFO   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_K_MEM_QUERY    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82D, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _WINTERNAL_SIGLEVEL_IN {
+    UINT32 Pid;
+    UINT8  SignatureLevel;       // SE_SIGNING_LEVEL_*
+    UINT8  SectionSignatureLevel;
+    UINT8  Reserved[2];
+    UINT32 FieldOffset;          // 0 = driver default (0x878)
+    UINT32 Reserved2;
+} WINTERNAL_SIGLEVEL_IN, *PWINTERNAL_SIGLEVEL_IN;
+
+typedef struct _WINTERNAL_SIGLEVEL_OUT {
+    UINT8  PrevSignatureLevel;
+    UINT8  PrevSectionSignatureLevel;
+    UINT8  Reserved[2];
+    UINT32 FieldOffsetUsed;
+} WINTERNAL_SIGLEVEL_OUT, *PWINTERNAL_SIGLEVEL_OUT;
+
+#define WINTERNAL_DEFAULT_SIGLEVEL_OFFSET 0x878
+#define WINTERNAL_SIGLEVEL_WINDOWS        0x0C
+#define WINTERNAL_SIGLEVEL_WINDOWS_TCB    0x0E
+
+//
+// ---- KCODE_PATCH ----
+//
+// Address: kernel virtual address to patch.
+// Length:  number of bytes to write (max 64 per call).
+// Data:    bytes to write.
+//
+#define WINTERNAL_KCODE_PATCH_MAX 64
+
+typedef struct _WINTERNAL_KCODE_PATCH_IN {
+    UINT64 Address;
+    UINT32 Length;
+    UINT32 Reserved;
+    UCHAR  Data[WINTERNAL_KCODE_PATCH_MAX];
+} WINTERNAL_KCODE_PATCH_IN, *PWINTERNAL_KCODE_PATCH_IN;
+
+typedef struct _WINTERNAL_GET_TRUE_STUB_OUT {
+    UINT64 Address;
+} WINTERNAL_GET_TRUE_STUB_OUT, *PWINTERNAL_GET_TRUE_STUB_OUT;
+
+typedef struct _WINTERNAL_GET_W32PROC_IN {
+    UINT32 Pid;
+    UINT32 Reserved;
+} WINTERNAL_GET_W32PROC_IN, *PWINTERNAL_GET_W32PROC_IN;
+
+typedef struct _WINTERNAL_GET_W32PROC_OUT {
+    UINT64 Address;       // 0 if process has no Win32Process / not a GUI thread
+} WINTERNAL_GET_W32PROC_OUT, *PWINTERNAL_GET_W32PROC_OUT;
+
+//
+// ---- Kernel-side process inspection ----
+//
+// Each handler takes a PID and returns the relevant snapshot. The driver
+// performs the actual query via the Zw* / Ke* primitive that's PreviousMode-
+// aware, so user-mode IAT/EAT/inline detours don't filter the result.
+//
+
+#define WINTERNAL_MAX_THREADS_PER_PROC 1024
+
+typedef struct _WINTERNAL_PID_IN {
+    UINT32 Pid;
+    UINT32 Reserved;
+} WINTERNAL_PID_IN, *PWINTERNAL_PID_IN;
+
+typedef struct _WINTERNAL_THREAD_ENTRY {
+    UINT32 Tid;
+    UINT32 State;            // 0..9 (Initialized, Ready, Running, ...)
+    UINT32 WaitReason;       // 0..40 (Executive, FreePage, Suspended, ...)
+    INT32  Priority;
+    UINT64 StartAddress;     // user-mode or kernel start address
+    UINT64 KernelTime100Ns;
+    UINT64 UserTime100Ns;
+    UINT64 CreateTimeFt;
+} WINTERNAL_THREAD_ENTRY, *PWINTERNAL_THREAD_ENTRY;
+
+typedef struct _WINTERNAL_THREADS_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_THREAD_ENTRY Entries[1];   // [Count]
+} WINTERNAL_THREADS_OUT, *PWINTERNAL_THREADS_OUT;
+
+#define WINTERNAL_MITIGATION_COUNT 16
+
+typedef struct _WINTERNAL_MITIGATION_ITEM {
+    UINT32 PolicyId;
+    INT32  NtStatus;          // 0 = OK; ERROR_INVALID_PARAMETER → unsupported
+    UINT64 Value;
+} WINTERNAL_MITIGATION_ITEM, *PWINTERNAL_MITIGATION_ITEM;
+
+typedef struct _WINTERNAL_MITIGATIONS_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_MITIGATION_ITEM Items[WINTERNAL_MITIGATION_COUNT];
+} WINTERNAL_MITIGATIONS_OUT, *PWINTERNAL_MITIGATIONS_OUT;
+
+#define WINTERNAL_MAX_PRIVILEGES 64
+
+typedef struct _WINTERNAL_TOKEN_PRIV {
+    UINT64 Luid;
+    UINT32 Attributes;
+    UINT32 Reserved;
+} WINTERNAL_TOKEN_PRIV;
+
+typedef struct _WINTERNAL_TOKEN_INFO_OUT {
+    UCHAR  UserSid[256];        // raw SID, null-padded
+    UCHAR  IntegritySid[64];    // raw SID, null-padded
+    UINT32 IntegrityRid;        // last subauth of IntegritySid for convenience
+    UINT32 ElevationType;       // 1=default 2=full 3=limited
+    UINT32 Elevated;
+    UINT32 UIAccess;
+    UINT32 SessionId;
+    UINT32 PrivCount;
+    WINTERNAL_TOKEN_PRIV Privileges[WINTERNAL_MAX_PRIVILEGES];
+} WINTERNAL_TOKEN_INFO_OUT, *PWINTERNAL_TOKEN_INFO_OUT;
+
+#define WINTERNAL_MAX_MEM_REGIONS 2048
+
+typedef struct _WINTERNAL_MEM_REGION {
+    UINT64 BaseAddress;
+    UINT64 RegionSize;
+    UINT32 State;       // MEM_COMMIT / MEM_RESERVE / MEM_FREE
+    UINT32 Protect;     // PAGE_*
+    UINT32 Type;        // MEM_IMAGE / MEM_MAPPED / MEM_PRIVATE
+    UINT32 Reserved;
+} WINTERNAL_MEM_REGION, *PWINTERNAL_MEM_REGION;
+
+typedef struct _WINTERNAL_MEM_QUERY_OUT {
+    UINT32 Count;
+    UINT32 Truncated;     // 1 if hit WINTERNAL_MAX_MEM_REGIONS cap
+    WINTERNAL_MEM_REGION Entries[1];   // [Count]
+} WINTERNAL_MEM_QUERY_OUT, *PWINTERNAL_MEM_QUERY_OUT;
+
+//
+// ---- Kernel callbacks ----
+//
+// Kinds: 1=PsSetCreateProcessNotifyRoutineEx array,
+//        2=PsSetLoadImageNotifyRoutine array,
+//        3=PsSetCreateThreadNotifyRoutine array.
+// The driver returns the routine pointer for each entry and (best effort)
+// the owning module's base + name by walking PsLoadedModuleList.
+//
+#define WINTERNAL_CB_KIND_PROCESS   1
+#define WINTERNAL_CB_KIND_IMAGE     2
+#define WINTERNAL_CB_KIND_THREAD    3
+
+typedef struct _WINTERNAL_CB_IN {
+    UINT32 Kind;
+    UINT32 Reserved;
+} WINTERNAL_CB_IN, *PWINTERNAL_CB_IN;
+
+typedef struct _WINTERNAL_CB_ENTRY {
+    UINT64 Routine;
+    UINT64 ModuleBase;
+    CHAR   ModuleName[64];      // NUL-terminated, 8.3-style short name
+} WINTERNAL_CB_ENTRY, *PWINTERNAL_CB_ENTRY;
+
+typedef struct _WINTERNAL_CB_LIST {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_CB_ENTRY Entries[1];
+} WINTERNAL_CB_LIST, *PWINTERNAL_CB_LIST;
+
+//
+// ---- Driver list (PsLoadedModuleList walk) ----
+//
+typedef struct _WINTERNAL_DRIVER_ENTRY {
+    UINT64 ImageBase;
+    UINT32 ImageSize;
+    UINT32 Reserved;
+    CHAR   Name[128];
+} WINTERNAL_DRIVER_ENTRY, *PWINTERNAL_DRIVER_ENTRY;
+
+typedef struct _WINTERNAL_DRIVER_LIST {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_DRIVER_ENTRY Entries[1];
+} WINTERNAL_DRIVER_LIST, *PWINTERNAL_DRIVER_LIST;
+
+//
+// ---- SSDT (KeServiceDescriptorTable) ----
+//
+typedef struct _WINTERNAL_SSDT_ENTRY {
+    UINT32 Index;
+    UINT32 Reserved;
+    UINT64 Routine;
+    UINT64 ModuleBase;
+    CHAR   ModuleName[64];
+} WINTERNAL_SSDT_ENTRY, *PWINTERNAL_SSDT_ENTRY;
+
+typedef struct _WINTERNAL_SSDT_LIST {
+    UINT32 Count;
+    UINT32 Base;          // KiServiceTable base address (for cross-checks)
+    WINTERNAL_SSDT_ENTRY Entries[1];
+} WINTERNAL_SSDT_LIST, *PWINTERNAL_SSDT_LIST;
+
+//
+// ---- Kernel-mode hook ----
+//
+typedef struct _WINTERNAL_KHOOK_INSTALL_IN {
+    UINT64 Target;
+    UINT64 Detour;
+    UINT32 PrologueSize;     // >= 14, <= 64
+    UINT32 Reserved;
+} WINTERNAL_KHOOK_INSTALL_IN, *PWINTERNAL_KHOOK_INSTALL_IN;
+
+typedef struct _WINTERNAL_KHOOK_INSTALL_OUT {
+    UINT64 Trampoline;       // kernel address; jmp here to invoke original
+} WINTERNAL_KHOOK_INSTALL_OUT, *PWINTERNAL_KHOOK_INSTALL_OUT;
+
+typedef struct _WINTERNAL_KHOOK_UNINSTALL_IN {
+    UINT64 Target;
+} WINTERNAL_KHOOK_UNINSTALL_IN, *PWINTERNAL_KHOOK_UNINSTALL_IN;
+
+//
+// ---- Kernel-mode Lua ----
+//
+// Layout of the input buffer:
+//     UINT32 ScriptLength;
+//     UINT32 Reserved;
+//     CHAR   Script[ScriptLength];     // UTF-8, not NUL-terminated
+//
+// Output:
+//     INT32  LuaStatus;                 // LUA_OK = 0 on success
+//     UINT32 OutputLength;
+//     CHAR   Output[OutputLength];      // captured prints + error text
+//
+#define WINTERNAL_LUA_MAX_SCRIPT  (4u * 1024u * 1024u)   // 4 MiB
+#define WINTERNAL_LUA_OUT_DEFAULT (256u * 1024u)         // 256 KiB
+
+typedef struct _WINTERNAL_LUA_IN {
+    UINT32 ScriptLength;
+    UINT32 Reserved;
+    CHAR   Script[1];      // ScriptLength bytes
+} WINTERNAL_LUA_IN, *PWINTERNAL_LUA_IN;
+
+typedef struct _WINTERNAL_LUA_OUT {
+    INT32  LuaStatus;
+    UINT32 OutputLength;
+    CHAR   Output[1];      // OutputLength bytes
+} WINTERNAL_LUA_OUT, *PWINTERNAL_LUA_OUT;
+
+//
+// ---- Lockdown / audit ----
+//
+typedef struct _WINTERNAL_LOCKDOWN_OUT {
+    UINT32 Engaged;        // 1 if lockdown is on
+    UINT32 EngagedTickMs;  // KeQueryUnbiasedInterruptTime / 10000 at engage
+} WINTERNAL_LOCKDOWN_OUT, *PWINTERNAL_LOCKDOWN_OUT;
+
+// One audit row.
+typedef struct _WINTERNAL_AUDIT_ROW {
+    UINT64 TimestampNs;      // KeQueryInterruptTimePrecise (100ns units)
+    UINT32 IoControlCode;
+    UINT32 CallerPid;
+    UINT64 Target;           // primary address argument (0 if N/A)
+    UINT32 Length;           // bytes affected
+    INT32  Status;           // NTSTATUS returned
+} WINTERNAL_AUDIT_ROW, *PWINTERNAL_AUDIT_ROW;
+
+typedef struct _WINTERNAL_AUDIT_OUT {
+    UINT32 RowCount;
+    UINT32 Reserved;
+    WINTERNAL_AUDIT_ROW Rows[1];
+} WINTERNAL_AUDIT_OUT, *PWINTERNAL_AUDIT_OUT;
+
+//
+// ---- Force unload driver ----
+//
+// Name is the short driver name without the "\Driver\" prefix. The driver
+// resolves the full name internally. Wide-char to match how driver names
+// are stored in the kernel.
+//
+#define WINTERNAL_DRIVER_NAME_MAX 64
+typedef struct _WINTERNAL_FORCE_UNLOAD_IN {
+    WCHAR Name[WINTERNAL_DRIVER_NAME_MAX];
+} WINTERNAL_FORCE_UNLOAD_IN, *PWINTERNAL_FORCE_UNLOAD_IN;
+
+//
+// ---- Kernel-level service registration ----
+//
+#define WINTERNAL_DRIVER_PATH_MAX 260
+typedef struct _WINTERNAL_KDRV_REGISTER_IN {
+    WCHAR Name[WINTERNAL_DRIVER_NAME_MAX];
+    WCHAR ImagePath[WINTERNAL_DRIVER_PATH_MAX];  // NT path: \??\C:\... or %SystemRoot%\system32\drivers\...
+    UINT32 StartType;          // SERVICE_DEMAND_START (3) by default
+    UINT32 Reserved;
+} WINTERNAL_KDRV_REGISTER_IN, *PWINTERNAL_KDRV_REGISTER_IN;
+
+typedef struct _WINTERNAL_KDRV_NAME_IN {
+    WCHAR Name[WINTERNAL_DRIVER_NAME_MAX];
+} WINTERNAL_KDRV_NAME_IN, *PWINTERNAL_KDRV_NAME_IN;
+
+typedef struct _WINTERNAL_KDRV_SET_START_IN {
+    WCHAR  Name[WINTERNAL_DRIVER_NAME_MAX];
+    UINT32 StartType;          // 0 boot, 1 system, 2 auto, 3 demand, 4 disabled
+    UINT32 Reserved;
+} WINTERNAL_KDRV_SET_START_IN, *PWINTERNAL_KDRV_SET_START_IN;

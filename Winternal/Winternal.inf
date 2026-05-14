@@ -1,0 +1,72 @@
+;
+; Winternal.inf — KMDF software-only kernel driver for the Winternal ARK
+; research toolkit. Installs as a root-enumerated System-class service.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+; "System" class with the long-standing System class GUID. Software-only
+; kernel drivers (no PnP hardware) belong here.
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = Winternal.cat
+; DriverVer is stamped automatically by the WDK's stampinf task at build
+; time. Leave blank — stampinf fills it. Inf2CatUseLocalTime=true in the
+; vcxproj makes the catalog tool compare against local clock so the build
+; doesn't break when local has crossed midnight but UTC hasn't.
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+Winternal.sys  = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+; Root-enumerated software-only driver. The hw-id "Root\Winternal" is what
+; devnode lookups (and `pnputil /enum-drivers`) match against; it has no
+; physical hardware behind it.
+%Winternal.DeviceDesc% = Winternal_Device, Root\Winternal
+
+[Winternal_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+Winternal.sys
+
+;-------------- Service installation
+[Winternal_Device.NT.Services]
+AddService = Winternal,%SPSVCINST_ASSOCSERVICE%, Winternal_Service_Inst
+
+; -------------- Winternal driver install sections
+[Winternal_Service_Inst]
+DisplayName    = %Winternal.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\Winternal.sys
+
+[Winternal_Device.NT.Wdf]
+KmdfService = Winternal, Winternal_wdfsect
+
+[Winternal_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "L5Z12"
+DiskName               = "Winternal Installation Disk"
+Winternal.DeviceDesc   = "Winternal ARK Research Driver"
+Winternal.SVCDESC      = "Winternal ARK Research Driver"

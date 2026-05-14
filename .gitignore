@@ -1,0 +1,127 @@
+# =============================================================================
+# Winternal — .gitignore
+# =============================================================================
+# Conventions:
+#   - Build artifacts at the repo-shared OutDir (x64/) and per-project IntDirs
+#   - Vendored Lua for the CLI is fetched at build time; the kernel-side copy
+#     under Winternal/klua/lua/ IS committed (no network at driver build time)
+#   - Visual Studio per-user state, IDA databases, NuGet caches all excluded
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Build outputs (shared OutDir + per-project IntDir)
+# -----------------------------------------------------------------------------
+/x64/
+/ARM64/
+**/x64/
+**/ARM64/
+**/Debug/
+**/Release/
+
+# Object/PDB/lib intermediates anywhere
+*.obj
+*.o
+*.pdb
+*.idb
+*.ilk
+*.iobj
+*.ipdb
+*.exp
+*.lastbuildstate
+*.tlog
+*.recipe
+*.metaproj
+*.metaproj.tmp
+
+# KMDF / signed-driver outputs
+*.sys
+*.cat
+*.cer
+*.pfx
+*.sln.docstates
+
+# WPP tracing
+*.tmh
+**/wpp_inc/
+**/inc/wpp_*/
+**/$(IntDir)wpp_*/
+
+# Stampinf-generated inf in build dirs is regenerated; the source inf is
+# kept under Winternal/Winternal.inf. Don't gitignore the source.
+
+# -----------------------------------------------------------------------------
+# Visual Studio / MSBuild
+# -----------------------------------------------------------------------------
+.vs/
+*.vcxproj.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.aps
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# -----------------------------------------------------------------------------
+# NuGet
+# -----------------------------------------------------------------------------
+/packages/
+**/packages/
+*.nupkg
+project.lock.json
+*.nuget.props
+*.nuget.targets
+
+# -----------------------------------------------------------------------------
+# Lua: CLI vendored copy is fetched on first build, never commit it.
+# Kernel-side copy lives in Winternal/klua/lua/ and IS committed.
+# -----------------------------------------------------------------------------
+/WinternalCLI/lua/
+*.luac
+
+# -----------------------------------------------------------------------------
+# IDA Pro
+# -----------------------------------------------------------------------------
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# -----------------------------------------------------------------------------
+# WinDbg / debugger droppings
+# -----------------------------------------------------------------------------
+*.dmp
+*.mdmp
+*.kdmp
+*.run
+
+# -----------------------------------------------------------------------------
+# Logs / scratch files
+# -----------------------------------------------------------------------------
+*.log
+build-*.log
+drv-build*.log
+/diag*.txt
+/out*.txt
+
+# -----------------------------------------------------------------------------
+# Editors / OS junk
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Runtime state we definitely don't want tracked
+# -----------------------------------------------------------------------------
+/plugins.lua            # %APPDATA%-style enable state if someone copies it in

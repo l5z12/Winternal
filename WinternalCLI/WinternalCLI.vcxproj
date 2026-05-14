@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64"><Configuration>Debug</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64"><Configuration>Release</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{111de2a4-99f2-42b1-ba00-5fa8374236de}</ProjectGuid>
+    <RootNamespace>WinternalCLI</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &gt;= '18.0'">v145</PlatformToolset>
+    <PlatformToolset Condition="'$(VisualStudioVersion)' &lt; '18.0'">v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <!--
+      Ship the CLI as Winternal.exe (not WinternalCLI.exe). The driver lives
+      next to it as Winternal.sys; matching basenames keep the deploy folder
+      tidy.
+    -->
+    <TargetName>Winternal</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'"><UseDebugLibraries>true</UseDebugLibraries></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'"><UseDebugLibraries>false</UseDebugLibraries><WholeProgramOptimization>true</WholeProgramOptimization></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>_CONSOLE;WIN32_LEAN_AND_MEAN;NOMINMAX;LUA_COMPAT_5_3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\WinternalCore;lua\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!--
+        Source files contain literal Unicode (em-dash, etc.). MSVC defaults
+        to the system codepage; force UTF-8 for both source AND execution
+        so string literals survive intact at runtime.
+      -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ntdll.lib;iphlpapi.lib;ws2_32.lib;advapi32.lib;psapi.lib;crypt32.lib;shell32.lib;shlwapi.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="WinternalCLI.cpp" />
+    <ClCompile Include="WinternalLua.cpp" />
+    <ClCompile Include="WinternalInstall.cpp" />
+    <ClCompile Include="WinternalDriverMgmt.cpp" />
+    <ClCompile Include="WinternalPlugins.cpp" />
+    <ClCompile Include="Hook64.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Hook64.h" />
+  </ItemGroup>
+  <!--
+    Lua 5.4 sources, dropped in by tools/fetch-lua.ps1 on first build.
+    We use Glob via wildcards so we don't have to enumerate every .c file
+    when bumping versions. lua.c (stand-alone interpreter main) and luac.c
+    (compiler main) define their own main() — exclude them.
+  -->
+  <ItemGroup>
+    <ClCompile Include="lua\src\*.c" Exclude="lua\src\lua.c;lua\src\luac.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <DisableSpecificWarnings>4244;4267;4334;4324;4310;4456;4459;4701;4702;4706;4204;4324</DisableSpecificWarnings>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\WinternalCore\WinternalCore.vcxproj">
+      <Project>{a1b2c3d4-1111-4222-9333-abcdef000001}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Target Name="CopyPluginsToOutput" AfterTargets="Build">
+    <!--
+      Copy WinternalCLI/plugins/* into the build output so the freshly-built
+      exe finds them without manual copy. Per-plugin folder layout. Robocopy
+      returns non-zero exit codes for "files copied" which would fail the
+      build, so guard with ContinueOnError.
+    -->
+    <ItemGroup>
+      <PluginFiles Include="plugins\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PluginFiles)"
+          DestinationFiles="@(PluginFiles->'$(OutDir)plugins\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
