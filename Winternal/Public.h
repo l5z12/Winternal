@@ -117,6 +117,27 @@ DEFINE_GUID (GUID_DEVINTERFACE_Winternal,
 // Bypasses SCM entirely so it works on drivers that don't accept
 // SERVICE_ACCEPT_STOP. Dangerous: the target may have outstanding IRPs,
 // callbacks, or timers it expected PnP to drain first.
+// Self-protection — when engaged, the driver:
+//   * adds the owner PID to the protect_list (Ob callbacks strip destructive
+//     access on any OpenProcess to the CLI from anywhere else);
+//   * refuses IOCTLs that would weaken protection unless the caller is the
+//     owner PID: SELFPROTECT_SET (turning off), PROTECT_UNLOCK on the owner,
+//     FORCE_UNLOAD_DRIVER / KDRV_UNLOAD targeting "Winternal".
+// User-mode tightens the SCM service DACL in parallel so `sc stop` /
+// `sc delete` from outside the owner's session fails with ACCESS_DENIED.
+#define IOCTL_WINTERNAL_SELFPROTECT_SET    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x890, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_SELFPROTECT_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x891, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _WINTERNAL_SELFPROTECT_IN {
+    UINT32 Enable;       // 1 = engage, 0 = disengage
+    UINT32 OwnerPid;     // ignored on disengage
+} WINTERNAL_SELFPROTECT_IN, *PWINTERNAL_SELFPROTECT_IN;
+
+typedef struct _WINTERNAL_SELFPROTECT_OUT {
+    UINT32 Engaged;
+    UINT32 OwnerPid;
+} WINTERNAL_SELFPROTECT_OUT, *PWINTERNAL_SELFPROTECT_OUT;
+
 #define IOCTL_WINTERNAL_FORCE_UNLOAD_DRIVER CTL_CODE(FILE_DEVICE_UNKNOWN, 0x870, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Kernel-level driver management — uses ZwLoadDriver / ZwUnloadDriver and

@@ -13,9 +13,13 @@
 #include <Windows.h>
 #include <winsvc.h>
 #include <shlwapi.h>
+#include <sddl.h>
+#include <aclapi.h>
 #include <cstdio>
 #include <filesystem>
 #include <string>
+
+#pragma comment(lib, "advapi32.lib")
 
 using namespace winternal;
 
@@ -93,6 +97,10 @@ int CheckTestSigning() {
     return (ci.CodeIntegrityOptions & kOptionTestSign) ? 1 : 0;
 }
 
+// Forward decl — used by install/uninstall to recover from a selfprotect-
+// leftover DACL. Implementation lives near the selfprotect helpers below.
+static bool RecoverServiceRegistry();
+
 int CmdInstall(int argc, wchar_t** argv) {
     if (!IsAdmin()) {
         fwprintf(stderr, L"install: requires an elevated prompt (right-click -> Run as administrator).\n");
@@ -123,6 +131,24 @@ int CmdInstall(int argc, wchar_t** argv) {
 
     // If the service already exists, reuse it — make this idempotent.
     SC_HANDLE svc = ::OpenServiceW(scm, kServiceName, SERVICE_ALL_ACCESS);
+    DWORD openErr = svc ? 0 : ::GetLastError();
+    if (!svc && openErr == ERROR_ACCESS_DENIED) {
+        // Leftover from selfprotect — service exists but DACL is locked.
+        // Restore a permissive DACL via direct registry write, then retry.
+        wprintf(L"install: existing service has restrictive DACL (selfprotect leftover) — restoring via registry...\n");
+        if (RecoverServiceRegistry()) {
+            svc = ::OpenServiceW(scm, kServiceName, SERVICE_ALL_ACCESS);
+            if (svc) {
+                wprintf(L"install: registry recovery succeeded; reusing service.\n");
+            } else {
+                fwprintf(stderr,
+                    L"install: SCM still rejects (%lu). Reboot to let SCM reload the DACL, "
+                    L"then re-run `winternal install`.\n", ::GetLastError());
+                ::CloseServiceHandle(scm);
+                return 1;
+            }
+        }
+    }
     if (!svc) {
         svc = ::CreateServiceW(
             scm, kServiceName, kDisplayName,
@@ -134,8 +160,19 @@ int CmdInstall(int argc, wchar_t** argv) {
             nullptr, nullptr, nullptr, nullptr, nullptr);
         if (!svc) {
             DWORD e = ::GetLastError();
+            if (e == ERROR_SERVICE_EXISTS) {
+                // Service is in SCM but OpenService said ACCESS_DENIED *and*
+                // the registry recovery above didn't help — SCM has the old
+                // DACL cached in memory and won't refresh until reboot.
+                fwprintf(stderr,
+                    L"install: service exists in SCM but is unreachable (DACL-locked).\n"
+                    L"  This is a selfprotect leftover. SCM caches DACLs in memory,\n"
+                    L"  so a reboot is required. After reboot:\n"
+                    L"    winternal install\n");
+            } else {
+                fwprintf(stderr, L"install: CreateService failed (%lu).\n", e);
+            }
             ::CloseServiceHandle(scm);
-            fwprintf(stderr, L"install: CreateService failed (%lu).\n", e);
             return 1;
         }
         wprintf(L"Created service '%s'.\n", kServiceName);
@@ -187,6 +224,18 @@ int CmdUninstall() {
     if (!scm) { fwprintf(stderr, L"uninstall: OpenSCManager failed (%lu).\n", ::GetLastError()); return 1; }
 
     SC_HANDLE svc = ::OpenServiceW(scm, kServiceName, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+    if (!svc && ::GetLastError() == ERROR_ACCESS_DENIED) {
+        // Same selfprotect-leftover recovery as install: restore permissive
+        // DACL via registry, then re-open.
+        wprintf(L"uninstall: service DACL is locked (selfprotect leftover) — restoring via registry...\n");
+        if (RecoverServiceRegistry())
+            svc = ::OpenServiceW(scm, kServiceName, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+        if (!svc) {
+            fwprintf(stderr,
+                L"uninstall: SCM still rejects (%lu) — DACL is cached in memory.\n"
+                L"  Reboot, then re-run `winternal uninstall`.\n", ::GetLastError());
+        }
+    }
     if (svc) {
         SERVICE_STATUS st{};
         ::ControlService(svc, SERVICE_CONTROL_STOP, &st);   // best-effort stop
@@ -198,7 +247,8 @@ int CmdUninstall() {
         }
         ::CloseServiceHandle(svc);
         wprintf(L"Service '%s' deleted.\n", kServiceName);
-    } else if (::GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) {
+    } else if (::GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST &&
+               ::GetLastError() != ERROR_ACCESS_DENIED) {
         fwprintf(stderr, L"uninstall: OpenService failed (%lu).\n", ::GetLastError());
     }
     ::CloseServiceHandle(scm);
@@ -338,6 +388,158 @@ int CmdSelftest() {
     return 0;
 }
 
+// Set the service-object DACL via SDDL. On engage we restrict everyone
+// except SYSTEM to read-only — `sc stop` / `sc delete` from a different
+// elevated admin gets ACCESS_DENIED. The owning CLI can still disengage
+// because the SELFPROTECT_SET IOCTL is gated on caller-PID, not SCM ACL.
+static bool SetServiceSddl(const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) { ::LocalFree(sd); return false; }
+    SC_HANDLE svc = ::OpenServiceW(scm, kServiceName,
+                                   READ_CONTROL | WRITE_DAC | SERVICE_QUERY_CONFIG);
+    if (!svc) {
+        ::CloseServiceHandle(scm); ::LocalFree(sd); return false;
+    }
+    bool ok = ::SetServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION, sd) != FALSE;
+    ::CloseServiceHandle(svc);
+    ::CloseServiceHandle(scm);
+    ::LocalFree(sd);
+    return ok;
+}
+
+// SDDL strings: SY = SYSTEM, BA = Builtin Admins, AU = Authenticated Users.
+// Mask chars for services: CC=QueryConfig LC=QueryStatus SW=EnumDeps LO=Interrogate
+//                          CR=UserCtl RC=ReadControl RP=Start WP=Stop DT=PauseCont DC=Delete.
+constexpr const wchar_t* kSddlPermissive =
+    L"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;AU)";
+constexpr const wchar_t* kSddlRestricted =
+    L"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWLOCRRC;;;BA)";
+
+// Self-protect leftover recovery — if a previous CLI invocation engaged
+// selfprotect and then exited without disengaging, the service DACL is
+// locked so admin can't `OpenService` for stop/delete (ACCESS_DENIED)
+// and `CreateService` says ERROR_SERVICE_EXISTS. Recovery path: write
+// a permissive DACL directly into the registry, then ask SCM to refresh.
+// Registry writes are gated on standard regkey ACL (admin allowed) not
+// on the service object's DACL, so they always succeed for admins.
+static bool RecoverServiceRegistry() {
+    HKEY hKey = nullptr;
+    LONG rc = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\Winternal", 0,
+        KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
+    if (rc != ERROR_SUCCESS) return false;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    ULONG sdLen = 0;
+    if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kSddlPermissive, SDDL_REVISION_1, &sd, &sdLen)) {
+        ::RegSetValueExW(hKey, L"Security", 0, REG_BINARY,
+                         (const BYTE*)sd, sdLen);
+        ::LocalFree(sd);
+    } else {
+        // Fall back to removing the Security value entirely — SCM will
+        // default the DACL on next access.
+        ::RegDeleteValueW(hKey, L"Security");
+    }
+    ::RegCloseKey(hKey);
+    return true;
+}
+
+// Stand-alone recovery — for when the driver is gone, the service is
+// stuck with a locked DACL, and you can't even run `winternal selfprotect
+// off`. Writes a permissive DACL directly to the service's registry
+// `Security` value. Requires admin + a reboot to take effect, since SCM
+// only re-reads service ACLs across boots.
+int CmdRecover() {
+    if (!IsAdmin()) {
+        fwprintf(stderr, L"recover: requires an elevated prompt.\n");
+        return 1;
+    }
+    if (RecoverServiceRegistry()) {
+        wprintf(L"recover: permissive DACL written to "
+                L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Winternal\\Security.\n"
+                L"Reboot for SCM to pick it up. After reboot:\n"
+                L"  winternal install      # to bring the driver back\n"
+                L"  winternal uninstall    # to remove the service entirely\n");
+        return 0;
+    }
+    fwprintf(stderr,
+        L"recover: could not write to the service registry key.\n"
+        L"  Verify the service entry exists:\n"
+        L"    reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\Winternal\n");
+    return 1;
+}
+
+int CmdSelfProtect(int argc, wchar_t** argv) {
+    DriverSession ds;
+    if (!ds.open()) {
+        fwprintf(stderr, L"selfprotect: Winternal.sys not loaded (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    std::wstring_view sub = (argc < 1) ? std::wstring_view(L"status") : std::wstring_view(argv[0]);
+
+    if (sub == L"status") {
+        auto st = ds.selfProtectStatus();
+        if (!st) { fwprintf(stderr, L"selfprotect: status IOCTL failed (%lu)\n", ::GetLastError()); return 1; }
+        wprintf(L"selfprotect: %ls\n", st->engaged ? L"ENGAGED" : L"off");
+        if (st->engaged) wprintf(L"owner PID:   %u\n", st->ownerPid);
+        return 0;
+    }
+    if (sub == L"on") {
+        DWORD me = ::GetCurrentProcessId();
+        if (!ds.selfProtectSet(true, me)) {
+            fwprintf(stderr, L"selfprotect on: IOCTL failed (%lu)\n", ::GetLastError());
+            return 1;
+        }
+        if (!SetServiceSddl(kSddlRestricted))
+            fwprintf(stderr, L"selfprotect on: service DACL not tightened (%lu) — driver protection still active.\n",
+                     ::GetLastError());
+        wprintf(L"selfprotect: ENGAGED. Driver + service are now locked down.\n");
+        wprintf(L"  * SCM:    sc stop / sc delete from any non-SYSTEM caller -> ACCESS_DENIED\n");
+        wprintf(L"  * Driver: weaken-protection IOCTLs (force-unload Winternal, protect-unlock\n");
+        wprintf(L"            of owner, selfprotect-off) require the caller image's SHA-256 to\n");
+        wprintf(L"            match this binary's SHA-256. Future invocations of THIS Winternal.exe\n");
+        wprintf(L"            can disengage; nothing else can.\n");
+        wprintf(L"  * CLI:    per-process OpenProcess filtering is NOT applied — this CLI is\n");
+        wprintf(L"            one-shot and would only briefly cover itself anyway. For an\n");
+        wprintf(L"            interactive session you want filtered, run:\n");
+        wprintf(L"              winternal protect <pid> --force\n");
+        wprintf(L"            from inside (or before) that session.\n");
+        wprintf(L"To disengage: `winternal selfprotect off` from the same Winternal.exe. If you\n");
+        wprintf(L"forget and the service becomes unreachable: `winternal recover` + reboot.\n");
+        return 0;
+    }
+    if (sub == L"off") {
+        if (!ds.selfProtectSet(false, 0)) {
+            fwprintf(stderr, L"selfprotect off: IOCTL failed (%lu)\n", ::GetLastError());
+            return 1;
+        }
+        // Driver-side gate is cleared. Now restore the SCM DACL. If SCM
+        // refuses (the DACL was locked by a previous session and SCM has
+        // it cached in memory), fall through to a direct registry write —
+        // that survives a reboot, after which SCM picks up the permissive
+        // DACL on next boot.
+        if (!SetServiceSddl(kSddlPermissive)) {
+            DWORD e = ::GetLastError();
+            if (e == ERROR_ACCESS_DENIED && RecoverServiceRegistry()) {
+                wprintf(L"selfprotect off: SCM ACL was cached-locked; wrote permissive DACL to "
+                        L"registry. SCM will pick it up after a reboot. Driver-side gate is cleared "
+                        L"now (\\\\.\\Winternal IOCTLs work).\n");
+            } else {
+                fwprintf(stderr, L"selfprotect off: service DACL not restored (%lu)\n", e);
+            }
+        }
+        wprintf(L"selfprotect: off\n");
+        return 0;
+    }
+    fwprintf(stderr,
+             L"selfprotect: unknown subcommand '%ls'\n"
+             L"usage: winternal selfprotect [on|off|status]\n", argv[0]);
+    return 1;
+}
+
 int CmdStatus() {
     SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) { fwprintf(stderr, L"status: OpenSCManager failed (%lu).\n", ::GetLastError()); return 1; }
@@ -386,4 +588,6 @@ int RunInstall(int argc, wchar_t** argv)   { return CmdInstall(argc, argv); }
 int RunUninstall()                          { return CmdUninstall(); }
 int RunStatus()                             { return CmdStatus(); }
 int RunSelftest()                           { return CmdSelftest(); }
+int RunSelfProtect(int argc, wchar_t** argv){ return CmdSelfProtect(argc, argv); }
+int RunRecover()                            { return CmdRecover(); }
 }

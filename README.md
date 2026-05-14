@@ -163,6 +163,7 @@ Scripting:
 
 Service management (admin):
   install [--path SYS] [--no-start]    uninstall    status    selftest
+  selfprotect [on|off|status]                  block external tampering
 
 Driver management (admin):
   drv list | start | stop | enable | disable | delete <name>
@@ -466,6 +467,7 @@ state file across the disable / revert cycle.
 | `KDRV_REGISTER / LOAD / UNLOAD / DEREGISTER / SET_START` | SCM-bypassing driver lifecycle (ZwLoadDriver + reg writes) |
 | `NTFS_RAW_READ`                      | ZwReadFile on a `\Device\*` from kernel mode |
 | `NTFS_VOL_DATA / USN_QUERY / USN_READ / MFT_ENUM / STREAMS` | FSCTL passthrough via `ZwFsControlFile` + `ZwQueryInformationFile` (PreviousMode=Kernel) |
+| `SELFPROTECT_SET / STATUS`           | owner-PID gate on weaken-protection IOCTLs (force-unload, protect-unlock, selfprotect-off) |
 
 Every state-mutating IOCTL is SEH-wrapped at the dispatcher level, audited
 into a 1024-row ring buffer, and refused once lockdown is engaged.
@@ -478,6 +480,61 @@ canonical kernel range) before any read/write.
 every other CPU is paused at IPI_LEVEL while one CPU clears CR0.WP, writes
 the prologue, restores CR0.WP, and ack's. Targets running on other cores
 never see a half-written prologue.
+
+## Self-protection
+
+```powershell
+winternal selfprotect on                        # engage
+winternal selfprotect status
+winternal selfprotect off                       # disengage
+```
+
+Engaging makes the driver + service actively resist tampering from
+other admin-elevated processes:
+
+| Vector                              | Mitigation                                              |
+| ----------------------------------- | ------------------------------------------------------- |
+| `sc stop Winternal` from anyone — admin, SYSTEM, scheduler task | Kernel-mode hook on `NtUnloadDriver` refuses calls whose `DriverServiceName` ends in `\Winternal` while self-protect is engaged. SCM DACL is a secondary layer; the syscall hook is the actual stop-prevention since admin → SYSTEM is trivial. |
+| `sc delete Winternal`               | Service DACL (SYSTEM-only) — bypassable by SYSTEM-elevated processes, but the syscall hook above means even after `sc delete` the driver stays loaded until reboot. |
+| `winternal drv unload Winternal` from another binary | Dispatcher refuses `FORCE_UNLOAD_DRIVER` / `KDRV_UNLOAD` targeting "Winternal" unless the caller's image SHA-256 matches the owner's hash. |
+| Another admin calling `protect-unlock` on the owner | Dispatcher refuses `PROTECT_UNLOCK` of the owner PID unless the caller's hash matches. |
+| Another admin calling `selfprotect off` | Dispatcher refuses `SELFPROTECT_SET(0)` unless the caller's hash matches. |
+
+What `selfprotect` deliberately does **not** do: add the engaging CLI's
+PID to the Ob protect-list. The CLI is one-shot — it exits seconds
+after `selfprotect on` returns — so a PID-based filter would only
+briefly cover the CLI itself and then leak a stale (potentially-reused)
+PID into the protect list. If you want OpenProcess filtering on an
+interactive session (e.g. `winternal lua` REPL), run
+`winternal protect <pid> --force` from inside it; the Ob surface is
+intentionally a separate, manually-invoked tool from `selfprotect`.
+
+Identity check uses a **SHA-256 of the caller's main image** computed
+in kernel mode via BCrypt. On `selfprotect on` the driver locates the
+calling process's image with `SeLocateProcessImageName`, reads the
+on-disk bytes (capped at 16 MiB) via `ZwReadFile` with
+`PreviousMode=Kernel`, hashes them, and stores the 32-byte digest. On
+every later weaken-protection IOCTL the driver re-hashes the current
+caller's image and compares — letting subsequent invocations of the
+*same binary* (across reboots of the CLI process, not the OS) through
+while refusing anything else, including a process that's been renamed
+to `Winternal.exe`. Tying to the file's bytes rather than to a PID
+also avoids locking-in protection forever when the engaging CLI exits.
+
+If an attacker swaps the `Winternal.exe` on disk *after* engage, their
+new file hashes differently and the gate refuses them — but they've
+also already broken your tool more fundamentally, so the practical
+attack surface is small.
+
+**Not protected against:** kernel-mode tampering (another loaded driver
+patching our handlers or restoring our `NtUnloadDriver` prologue), DLL
+injection into the CLI before `selfprotect on` runs, an attacker
+controlling the binary *before* engage, HVCI swallowing the
+`NtUnloadDriver` patch silently (if the readback fails the install
+errors; the SCM DACL stays as fallback), or a Windows reboot.
+Self-protection is a defense against malware running in an admin
+user-mode process — not a substitute for HVCI or signed-driver
+enforcement.
 
 ## Lockdown + audit
 

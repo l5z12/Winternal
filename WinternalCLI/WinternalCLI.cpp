@@ -62,6 +62,8 @@ int RunStatus();
 int RunSelftest();
 int RunDriverMgmt(int argc, wchar_t** argv);
 int RunNtfsCommand(int argc, wchar_t** argv);
+int RunSelfProtect(int argc, wchar_t** argv);
+int RunRecover();
 namespace plugins { int RunPluginCommand(int argc, wchar_t** argv); }
 }
 
@@ -150,6 +152,8 @@ void PrintHelp() {
     app.subcommand(under(L"uninstall", L"uninstall",                     L"stop + delete service, remove file", H_SVC));
     app.subcommand(under(L"status",    L"status",                        L"service state, signing, driver online?", H_SVC));
     app.subcommand(under(L"selftest",  L"selftest",                      L"end-to-end verification of every IOCTL", H_SVC));
+    app.subcommand(under(L"selfprotect", L"selfprotect [on|off|status]", L"engage Ob-callback process protection + service DACL hardening so other admins can't kill us", H_SVC));
+    app.subcommand(under(L"recover", L"recover",                                   L"unstick a selfprotect-leftover service DACL (registry write; reboot required)", H_SVC));
 
     // Plugins.
     app.subcommand(under(L"plugin-list",    L"plugin list",              L"enumerate manifested plugins", H_PLUG));
@@ -2277,6 +2281,8 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"plugin" || cmd == L"plugins") { return winternal::plugins::RunPluginCommand(sub, sa); }
     if (cmd == L"drv")       { return winternal::RunDriverMgmt(sub, sa); }
     if (cmd == L"ntfs")      { return winternal::RunNtfsCommand(sub, sa); }
+    if (cmd == L"selfprotect"){ return winternal::RunSelfProtect(sub, sa); }
+    if (cmd == L"recover")   { return winternal::RunRecover(); }
 
     fwprintf(stderr, L"Unknown command: %s\n", argv[1]);
     PrintHelp();

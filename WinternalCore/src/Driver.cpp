@@ -487,6 +487,18 @@ DriverSession::ntfsStreams(std::wstring_view ntPath) {
     return out;
 }
 
+bool DriverSession::selfProtectSet(bool enable, uint32_t ownerPid) {
+    WINTERNAL_SELFPROTECT_IN in{ enable ? 1u : 0u, ownerPid };
+    return ioctl_(IOCTL_WINTERNAL_SELFPROTECT_SET, &in, sizeof(in), nullptr, 0, nullptr);
+}
+
+std::optional<DriverSession::SelfProtect> DriverSession::selfProtectStatus() {
+    WINTERNAL_SELFPROTECT_OUT out{};
+    if (!ioctl_(IOCTL_WINTERNAL_SELFPROTECT_STATUS, nullptr, 0, &out, sizeof(out), nullptr))
+        return std::nullopt;
+    return SelfProtect{ out.Engaged != 0, out.OwnerPid };
+}
+
 std::optional<std::vector<uint8_t>>
 DriverSession::ntfsRawRead(std::wstring_view device, uint64_t offset, uint32_t length) {
     if (length == 0 || length > WINTERNAL_NTFS_RAW_MAX) {

@@ -248,6 +248,14 @@ public:
     std::optional<std::vector<uint8_t>>
         ntfsStreams(std::wstring_view ntPath);
 
+    // Self-protection. When engaged, the driver auto-adds `ownerPid` to
+    // the Ob protect list and refuses any IOCTL that would weaken
+    // protection (disengage, unprotect of owner, force-unload Winternal,
+    // SCM lifecycle of "Winternal") unless the caller IS the owner PID.
+    bool selfProtectSet(bool enable, uint32_t ownerPid);
+    struct SelfProtect { bool engaged; uint32_t ownerPid; };
+    std::optional<SelfProtect> selfProtectStatus();
+
 private:
     HandleGuard handle_;
     bool ioctl_(uint32_t code, const void* in, uint32_t inLen, void* out, uint32_t outLen, uint32_t* bytesReturned);

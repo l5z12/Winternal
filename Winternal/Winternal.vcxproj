@@ -152,7 +152,7 @@
       <WppKernelMode>true</WppKernelMode>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;$(DDK_LIB_PATH)\cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!--
         /INTEGRITYCHECK sets IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80)
         in the PE header. ObRegisterCallbacks refuses to register pre-op
@@ -174,7 +174,7 @@
       <WppKernelMode>true</WppKernelMode>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;$(DDK_LIB_PATH)\cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!--
         /INTEGRITYCHECK sets IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80)
         in the PE header. ObRegisterCallbacks refuses to register pre-op
@@ -196,7 +196,7 @@
       <WppKernelMode>true</WppKernelMode>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;$(DDK_LIB_PATH)\cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!--
         /INTEGRITYCHECK sets IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80)
         in the PE header. ObRegisterCallbacks refuses to register pre-op
@@ -218,7 +218,7 @@
       <WppKernelMode>true</WppKernelMode>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\ntstrsafe.lib;$(DDK_LIB_PATH)\cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!--
         /INTEGRITYCHECK sets IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x80)
         in the PE header. ObRegisterCallbacks refuses to register pre-op

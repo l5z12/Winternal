@@ -42,6 +42,13 @@ Environment:
 #include <ntstrsafe.h>
 #include <ntimage.h>
 #include <intrin.h>
+#include <bcrypt.h>     // SHA-256 via cng.lib (added in Winternal.vcxproj)
+
+// SeLocateProcessImageName forward decl — exported by ntoskrnl on Win7+
+// but the WDK doesn't always pick it up via the default ntddk.h chain.
+NTKERNELAPI NTSTATUS SeLocateProcessImageName(
+    _In_  PEPROCESS Process,
+    _Out_ PUNICODE_STRING *ProcessImageName);
 
 //
 // Ntifs / ntoskrnl declarations the KMDF default headers don't include.
@@ -397,6 +404,94 @@ static BOOLEAN IsLockdownGated(ULONG Code)
 
 VOID WinternalKhookInit(VOID);
 VOID WinternalKhookUninstallAll(VOID);
+
+// Self-protection globals. At engage time we hash the caller's main
+// image (SHA-256 via BCrypt) and remember the digest. Every later
+// weaken-protection IOCTL re-hashes the current caller's image and
+// compares — letting subsequent invocations of the *same binary* through
+// while refusing anything else, including processes that have just been
+// renamed to `Winternal.exe`. Owner PID is kept around for STATUS
+// reporting only; the gate doesn't trust it.
+#define WN_SELFPROT_HASH_LEN 32
+static volatile LONG g_SelfProtect       = 0;
+static volatile LONG g_SelfProtectOwner  = 0;
+static UCHAR         g_SelfProtectHash[WN_SELFPROT_HASH_LEN] = {0};
+static KSPIN_LOCK    g_SelfProtectSpin;
+static BOOLEAN       g_SelfProtectSpinInit = FALSE;
+
+#define WN_SELFPROT_IMAGE_MAX (16u * 1024u * 1024u)   // 16 MiB cap on hashed image
+
+static NTSTATUS WinternalSha256(const void* data, ULONG len, UCHAR out[WN_SELFPROT_HASH_LEN])
+{
+    BCRYPT_ALG_HANDLE  hAlg  = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    NTSTATUS s = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (!NT_SUCCESS(s)) return s;
+    s = BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0);
+    if (NT_SUCCESS(s)) {
+        s = BCryptHashData(hHash, (PUCHAR)data, len, 0);
+        if (NT_SUCCESS(s)) s = BCryptFinishHash(hHash, out, WN_SELFPROT_HASH_LEN, 0);
+        BCryptDestroyHash(hHash);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return s;
+}
+
+// Open the caller's main image by NT path and hash its on-disk bytes.
+// Bypasses memory-resident image tampering (e.g. a hot-patch) — the
+// hash compares against the file the loader will pick up next time.
+// Capped at 16 MiB so a swapped image doesn't OOM the driver.
+static NTSTATUS WinternalHashCallerImage(UCHAR out[WN_SELFPROT_HASH_LEN])
+{
+    PEPROCESS proc = PsGetCurrentProcess();
+    if (!proc) return STATUS_NOT_FOUND;
+
+    PUNICODE_STRING imgName = NULL;
+    NTSTATUS s = SeLocateProcessImageName(proc, &imgName);
+    if (!NT_SUCCESS(s) || !imgName) return NT_SUCCESS(s) ? STATUS_NOT_FOUND : s;
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, imgName,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE h = NULL;
+    IO_STATUS_BLOCK iosb;
+    s = ZwCreateFile(&h, FILE_READ_DATA | SYNCHRONIZE, &oa, &iosb, NULL,
+                     FILE_ATTRIBUTE_NORMAL,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    ExFreePool(imgName);
+    if (!NT_SUCCESS(s)) return s;
+
+    FILE_STANDARD_INFORMATION info = {0};
+    s = ZwQueryInformationFile(h, &iosb, &info, sizeof(info), FileStandardInformation);
+    if (!NT_SUCCESS(s)) { ZwClose(h); return s; }
+    if (info.EndOfFile.QuadPart <= 0 || info.EndOfFile.QuadPart > WN_SELFPROT_IMAGE_MAX) {
+        ZwClose(h); return STATUS_FILE_TOO_LARGE;
+    }
+    ULONG size = (ULONG)info.EndOfFile.QuadPart;
+    PUCHAR buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, size, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!buf) { ZwClose(h); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    LARGE_INTEGER off = {0};
+    s = ZwReadFile(h, NULL, NULL, NULL, &iosb, buf, size, &off, NULL);
+    ZwClose(h);
+    if (NT_SUCCESS(s) && iosb.Information != size) s = STATUS_END_OF_FILE;
+    if (NT_SUCCESS(s)) s = WinternalSha256(buf, size, out);
+    ExFreePoolWithTag(buf, WINTERNAL_POOL_TAG_DEFAULT);
+    return s;
+}
+
+static BOOLEAN WinternalCallerIsOwner(VOID)
+{
+    if (!g_SelfProtect) return TRUE;  // not engaged, nothing to gate
+    UCHAR h[WN_SELFPROT_HASH_LEN];
+    if (!NT_SUCCESS(WinternalHashCallerImage(h))) return FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_SelfProtectSpin, &irql);
+    BOOLEAN match = RtlEqualMemory(h, g_SelfProtectHash, WN_SELFPROT_HASH_LEN);
+    KeReleaseSpinLock(&g_SelfProtectSpin, irql);
+    return match;
+}
 
 // -----------------------------------------------------------------------------
 // Unload drain
@@ -1095,6 +1190,125 @@ static VOID WinternalUninstallObUnregHook(VOID)
     g_ObUnregHookInstalled = FALSE;
 }
 
+// -----------------------------------------------------------------------------
+// NtUnloadDriver hook — refuses `sc stop` of our own driver while selfprotect
+// is engaged. Without this, an admin who escalates to SYSTEM (psexec -s,
+// scheduled task, etc.) trivially bypasses the SCM DACL we set. The SCM
+// DACL is a usability layer; this hook is the actual stop-prevention.
+// -----------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *PFN_NT_UNLOAD_DRIVER)(_In_ PUNICODE_STRING DriverServiceName);
+static PVOID         g_NtUnloadTarget        = NULL;
+static PUCHAR        g_NtUnloadTrampoline    = NULL;
+static PFN_NT_UNLOAD_DRIVER g_NtUnloadOriginal = NULL;
+static UCHAR         g_NtUnloadSavedProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+static ULONG         g_NtUnloadPrologSize    = 0;
+static BOOLEAN       g_NtUnloadHookInstalled = FALSE;
+
+// Suffix-match the service-key path against "\Winternal" case-insensitively.
+// Real arg is L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\Winternal".
+static BOOLEAN NtUnloadTargetsUs(_In_ PUNICODE_STRING name)
+{
+    if (!name || !name->Buffer || name->Length < (USHORT)(10 * sizeof(WCHAR))) return FALSE;
+    static const WCHAR kSuffix[] = L"\\Winternal";
+    const USHORT sufWchars = (USHORT)((sizeof(kSuffix) / sizeof(WCHAR)) - 1);
+    USHORT nameWchars = name->Length / sizeof(WCHAR);
+    if (nameWchars < sufWchars) return FALSE;
+    const WCHAR* tail = name->Buffer + (nameWchars - sufWchars);
+    for (USHORT i = 0; i < sufWchars; ++i) {
+        WCHAR a = tail[i], b = kSuffix[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+static NTSTATUS NTAPI WinternalNtUnloadDriver_Detour(_In_ PUNICODE_STRING DriverServiceName)
+{
+    if (g_SelfProtect) {
+        BOOLEAN refuse = FALSE;
+        __try {
+            // From user-mode callers (services.exe) the pointer is in user
+            // memory. ProbeForRead validates it's accessible; the embedded
+            // Buffer pointer also needs probing.
+            if (ExGetPreviousMode() != KernelMode) {
+                ProbeForRead(DriverServiceName, sizeof(UNICODE_STRING), sizeof(ULONG_PTR));
+            }
+            UNICODE_STRING local = *DriverServiceName;
+            if (local.Buffer && local.Length) {
+                if (ExGetPreviousMode() != KernelMode)
+                    ProbeForRead(local.Buffer, local.Length, sizeof(WCHAR));
+                refuse = NtUnloadTargetsUs(&local);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+        if (refuse) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] NtUnloadDriver: refused (selfprotect engaged)\n");
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+    return g_NtUnloadOriginal ? g_NtUnloadOriginal(DriverServiceName) : STATUS_NOT_IMPLEMENTED;
+}
+
+static NTSTATUS WinternalInstallNtUnloadHook(VOID)
+{
+    if (g_NtUnloadHookInstalled) return STATUS_SUCCESS;
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, L"NtUnloadDriver");
+    PVOID target = MmGetSystemRoutineAddress(&name);
+    if (!target) return STATUS_PROCEDURE_NOT_FOUND;
+
+    PUCHAR tramp = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE,
+                                           WINTERNAL_KHOOK_TRAMP_SIZE,
+                                           WINTERNAL_POOL_TAG_DEFAULT);
+    if (!tramp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    ULONG prolog = WINTERNAL_KHOOK_JMP_SIZE;
+    UCHAR newProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+    NTSTATUS status;
+    __try {
+        RtlCopyMemory(g_NtUnloadSavedProlog, target, prolog);
+        RtlCopyMemory(tramp, target, prolog);
+        KhookWriteJmpAbs(tramp + prolog, (PUCHAR)target + prolog);
+        KhookWriteJmpAbs(newProlog, (PVOID)(ULONG_PTR)WinternalNtUnloadDriver_Detour);
+        status = STATUS_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+
+    status = WinternalProtectWriteCode(target, newProlog, prolog);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+    g_NtUnloadTarget        = target;
+    g_NtUnloadTrampoline    = tramp;
+    g_NtUnloadOriginal      = (PFN_NT_UNLOAD_DRIVER)tramp;
+    g_NtUnloadPrologSize    = prolog;
+    g_NtUnloadHookInstalled = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static VOID WinternalUninstallNtUnloadHook(VOID)
+{
+    if (!g_NtUnloadHookInstalled) return;
+    (void)WinternalProtectWriteCode(g_NtUnloadTarget, g_NtUnloadSavedProlog, g_NtUnloadPrologSize);
+    if (g_NtUnloadTrampoline) {
+        ExFreePoolWithTag(g_NtUnloadTrampoline, WINTERNAL_POOL_TAG_DEFAULT);
+        g_NtUnloadTrampoline = NULL;
+    }
+    g_NtUnloadTarget        = NULL;
+    g_NtUnloadOriginal      = NULL;
+    g_NtUnloadPrologSize    = 0;
+    g_NtUnloadHookInstalled = FALSE;
+}
+
 // Lazy one-time registration. Altitude string is in the "free" altitude
 // range; it just needs to be unique on the system. If the system enforces
 // signing on ObRegisterCallbacks (some hardened SKUs do), this returns
@@ -1146,7 +1360,10 @@ static NTSTATUS WinternalEnsureObCallbacks(VOID)
 VOID WinternalProtectUnregister(VOID)
 {
     // Order matters: pull our hook off ObUnRegisterCallbacks BEFORE calling
-    // it ourselves, or we'd silently no-op our own cleanup.
+    // it ourselves, or we'd silently no-op our own cleanup. Also pull the
+    // NtUnloadDriver hook — if we unload while it's still installed, the
+    // jmp lands in freed pool and the next sc stop bug-checks the system.
+    WinternalUninstallNtUnloadHook();
     WinternalUninstallObUnregHook();
 
     if (g_ObCallbackHandle) {
@@ -1226,6 +1443,98 @@ static NTSTATUS HandleProtectList(PVOID OutBuf, size_t OutLen, size_t* Written)
         for (ULONG i = 0; i < g_LockedCount; ++i) out->Pids[i] = g_LockedPids[i];
         KeReleaseSpinLock(&g_LockSpin, irql);
     }
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+// Engage / disengage self-protection. On engage the owner PID is added to
+// the Ob-callback protect list so destructive OpenProcess access bits are
+// stripped from any other caller. Disengage is gated to the owner PID at
+// the dispatcher (so a different admin process can't flip the bit). The
+// IOCTL itself just toggles state + walks the protect list.
+static NTSTATUS HandleSelfProtectSet(PVOID InBuf, size_t InLen)
+{
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "[winternal] SELFPROTECT_SET entry: InLen=%zu InBuf=%p\n", InLen, InBuf);
+    if (InLen < sizeof(WINTERNAL_SELFPROTECT_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_SELFPROTECT_IN in = (PWINTERNAL_SELFPROTECT_IN)InBuf;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "[winternal] SELFPROTECT_SET: enable=%u owner=%u\n", in->Enable, in->OwnerPid);
+
+    if (in->Enable) {
+        if (in->OwnerPid == 0) return STATUS_INVALID_PARAMETER;
+        UINT32 ownerPid = in->OwnerPid;
+
+        // Hash the caller's main image. Every later weaken-protection
+        // IOCTL re-hashes its caller and must match this digest. We
+        // DON'T add the PID to the Ob protect list — the engaging CLI
+        // is one-shot and exits seconds after this returns, which would
+        // leave a stale (and eventually reusable) PID in the list. The
+        // identity that matters across CLI invocations is the binary
+        // hash, not the PID. If you want short-lived OpenProcess
+        // protection on an interactive session, run
+        // `winternal protect <pid> --force` explicitly.
+        UCHAR hash[WN_SELFPROT_HASH_LEN];
+        NTSTATUS hs = WinternalHashCallerImage(hash);
+        if (!NT_SUCCESS(hs)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] SELFPROTECT_SET: image hash failed 0x%08X\n", hs);
+            return hs;
+        }
+
+        if (!g_SelfProtectSpinInit) {
+            KeInitializeSpinLock(&g_SelfProtectSpin);
+            g_SelfProtectSpinInit = TRUE;
+        }
+        KIRQL irql;
+        KeAcquireSpinLock(&g_SelfProtectSpin, &irql);
+        RtlCopyMemory(g_SelfProtectHash, hash, WN_SELFPROT_HASH_LEN);
+        KeReleaseSpinLock(&g_SelfProtectSpin, irql);
+        InterlockedExchange(&g_SelfProtectOwner, (LONG)ownerPid);
+        InterlockedExchange(&g_SelfProtect, 1);
+
+        // Install the NtUnloadDriver syscall hook so `sc stop` from any
+        // caller (admin, SYSTEM-elevated process, scheduler task) is
+        // refused. The hook reads g_SelfProtect at every call — disengage
+        // both flips the flag and rips the hook out, so subsequent stops
+        // work normally.
+        NTSTATUS hkStatus = WinternalInstallNtUnloadHook();
+        if (!NT_SUCCESS(hkStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] SELFPROTECT_SET: NtUnloadDriver hook failed 0x%08X "
+                       "(SCM DACL still active)\n", hkStatus);
+        }
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] SELFPROTECT_SET: engaged, sha256=%02X%02X%02X%02X...\n",
+                   hash[0], hash[1], hash[2], hash[3]);
+        return STATUS_SUCCESS;
+    } else {
+        InterlockedExchange(&g_SelfProtectOwner, 0);
+        InterlockedExchange(&g_SelfProtect, 0);
+        if (g_SelfProtectSpinInit) {
+            KIRQL irql;
+            KeAcquireSpinLock(&g_SelfProtectSpin, &irql);
+            RtlZeroMemory(g_SelfProtectHash, WN_SELFPROT_HASH_LEN);
+            KeReleaseSpinLock(&g_SelfProtectSpin, irql);
+        }
+        // Pull the NtUnloadDriver hook so `sc stop` works again. Must
+        // happen BEFORE driver unload (which we also call into) — leaving
+        // a JMP to freed pool memory in ntoskrnl is a guaranteed BSOD.
+        WinternalUninstallNtUnloadHook();
+        // No Ob-list manipulation: engage didn't add to it, disengage
+        // doesn't remove from it. `winternal protect/unprotect` still
+        // works for explicit per-PID Ob protection on interactive sessions.
+        return STATUS_SUCCESS;
+    }
+}
+
+static NTSTATUS HandleSelfProtectStatus(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (OutLen < sizeof(WINTERNAL_SELFPROTECT_OUT)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_SELFPROTECT_OUT out = (PWINTERNAL_SELFPROTECT_OUT)OutBuf;
+    out->Engaged  = (UINT32)g_SelfProtect;
+    out->OwnerPid = (UINT32)g_SelfProtectOwner;
     *Written = sizeof(*out);
     return STATUS_SUCCESS;
 }
@@ -3838,6 +4147,12 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
     case IOCTL_WINTERNAL_NTFS_STREAMS:
         status = HandleNtfsStreams(InBuf, InLen, OutBuf, OutLen, BytesWritten);
         break;
+    case IOCTL_WINTERNAL_SELFPROTECT_SET:
+        status = HandleSelfProtectSet(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_SELFPROTECT_STATUS:
+        status = HandleSelfProtectStatus(OutBuf, OutLen, BytesWritten);
+        break;
     case IOCTL_WINTERNAL_FORCE_UNLOAD_DRIVER:
         status = HandleForceUnload(InBuf, InLen);
         break;
@@ -3904,6 +4219,58 @@ WinternalEvtIoDeviceControl(
         WdfRequestCompleteWithInformation(Request, STATUS_ACCESS_DENIED, 0);
         WinternalDispatchLeave();
         return;
+    }
+
+    // Self-protection gate: when engaged, only the owner PID may submit
+    // IOCTLs that would weaken protection. Includes turning off self-
+    // protect itself, unprotecting the owner, force-unloading our own
+    // driver, or driving SCM lifecycle against our service name.
+    if (g_SelfProtect) {
+        BOOLEAN refuse = FALSE;
+        switch (IoControlCode) {
+        case IOCTL_WINTERNAL_SELFPROTECT_SET: {
+            // Engage is fine from any admin (owner needs to be set once);
+            // disengage is owner-only.
+            if (InputBufferLength >= sizeof(WINTERNAL_SELFPROTECT_IN)) {
+                PWINTERNAL_SELFPROTECT_IN in = (PWINTERNAL_SELFPROTECT_IN)inBuf;
+                if (!in->Enable && !WinternalCallerIsOwner()) refuse = TRUE;
+            }
+            break;
+        }
+        case IOCTL_WINTERNAL_PROTECT_UNLOCK: {
+            if (InputBufferLength >= sizeof(WINTERNAL_PROTECT_LOCK_IN)) {
+                PWINTERNAL_PROTECT_LOCK_IN in = (PWINTERNAL_PROTECT_LOCK_IN)inBuf;
+                if ((LONG)in->Pid == g_SelfProtectOwner && !WinternalCallerIsOwner()) refuse = TRUE;
+            }
+            break;
+        }
+        case IOCTL_WINTERNAL_FORCE_UNLOAD_DRIVER:
+        case IOCTL_WINTERNAL_KDRV_UNLOAD: {
+            // Refuse if target name is "Winternal" (our own driver) and
+            // caller isn't us. Both IOCTLs use the same name struct layout.
+            if (InputBufferLength >= sizeof(WINTERNAL_FORCE_UNLOAD_IN)) {
+                PWINTERNAL_FORCE_UNLOAD_IN in = (PWINTERNAL_FORCE_UNLOAD_IN)inBuf;
+                if (_wcsnicmp(in->Name, L"Winternal", WINTERNAL_DRIVER_NAME_MAX) == 0
+                    && !WinternalCallerIsOwner()) refuse = TRUE;
+            }
+            break;
+        }
+        case IOCTL_WINTERNAL_KDRV_DEREGISTER:
+        case IOCTL_WINTERNAL_KDRV_SET_START: {
+            if (InputBufferLength >= sizeof(WINTERNAL_KDRV_NAME_IN)) {
+                PWINTERNAL_KDRV_NAME_IN in = (PWINTERNAL_KDRV_NAME_IN)inBuf;
+                if (_wcsnicmp(in->Name, L"Winternal", WINTERNAL_DRIVER_NAME_MAX) == 0
+                    && !WinternalCallerIsOwner()) refuse = TRUE;
+            }
+            break;
+        }
+        }
+        if (refuse) {
+            AuditAppend(IoControlCode, 0, 0, STATUS_ACCESS_DENIED);
+            WdfRequestCompleteWithInformation(Request, STATUS_ACCESS_DENIED, 0);
+            WinternalDispatchLeave();
+            return;
+        }
     }
 
     __try {
