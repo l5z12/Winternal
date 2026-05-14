@@ -357,6 +357,97 @@ typedef struct _WINTERNAL_TOKEN_UIACCESS_OUT {
 #define IOCTL_WINTERNAL_K_TOKEN_INFO   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINTERNAL_K_MEM_QUERY    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82D, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// Raw read from any \\Device\\* object (typically \\Device\\HarddiskVolumeN
+// for a volume, or \\Device\\PhysicalDriveN for the whole disk). The
+// driver opens the object with FILE_READ_DATA and PreviousMode = Kernel,
+// which routes the request straight to the device stack's lowest IRP_MJ_
+// READ handler — every minifilter and user-mode hook above it is bypassed.
+// This is the "ground truth" view of on-disk bytes, used by NTFS analysis
+// plugins to parse MFT records without trusting NtQueryDirectoryFile.
+// Caps: 1 MiB per call (raise WINTERNAL_NTFS_RAW_MAX if you need more).
+// Raw byte read from any \Device\* object (volume / physical drive).
+#define IOCTL_WINTERNAL_NTFS_RAW_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x880, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// FSCTL surfaces routed through the driver so they hit NTFS with
+// PreviousMode = Kernel — minifilters that filter per-process or per-
+// access-mode can't intercept these.
+#define IOCTL_WINTERNAL_NTFS_VOL_DATA   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x881, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_USN_QUERY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x882, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_USN_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x883, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_MFT_ENUM   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x884, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_NTFS_STREAMS    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x885, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_NTFS_RAW_MAX         (1u * 1024u * 1024u)
+#define WINTERNAL_NTFS_DEV_NAME_MAX    128
+#define WINTERNAL_NTFS_PATH_MAX        520
+#define WINTERNAL_NTFS_USN_BUF         (64u * 1024u)
+
+typedef struct _WINTERNAL_NTFS_RAW_READ_IN {
+    WCHAR  Device[WINTERNAL_NTFS_DEV_NAME_MAX]; // e.g. L"\\Device\\HarddiskVolume3"
+    UINT64 Offset;                              // byte offset (must be sector-aligned)
+    UINT32 Length;                              // bytes to read; <= WINTERNAL_NTFS_RAW_MAX
+    UINT32 Reserved;
+} WINTERNAL_NTFS_RAW_READ_IN, *PWINTERNAL_NTFS_RAW_READ_IN;
+
+// FSCTL_GET_NTFS_VOLUME_DATA passthrough — the driver opens the device,
+// issues the FSCTL with PreviousMode=Kernel, and returns the kernel's
+// NTFS_VOLUME_DATA_BUFFER (extended). Caller passes the device name;
+// output is the raw struct.
+typedef struct _WINTERNAL_NTFS_DEVICE_IN {
+    WCHAR Device[WINTERNAL_NTFS_DEV_NAME_MAX];
+} WINTERNAL_NTFS_DEVICE_IN, *PWINTERNAL_NTFS_DEVICE_IN;
+
+typedef struct _WINTERNAL_NTFS_VOL_DATA_OUT {
+    LARGE_INTEGER VolumeSerialNumber;
+    LARGE_INTEGER NumberSectors;
+    LARGE_INTEGER TotalClusters;
+    LARGE_INTEGER FreeClusters;
+    LARGE_INTEGER TotalReserved;
+    UINT32        BytesPerSector;
+    UINT32        BytesPerCluster;
+    UINT32        BytesPerFileRecordSegment;
+    UINT32        ClustersPerFileRecordSegment;
+    LARGE_INTEGER MftValidDataLength;
+    LARGE_INTEGER MftStartLcn;
+    LARGE_INTEGER Mft2StartLcn;
+    LARGE_INTEGER MftZoneStart;
+    LARGE_INTEGER MftZoneEnd;
+} WINTERNAL_NTFS_VOL_DATA_OUT, *PWINTERNAL_NTFS_VOL_DATA_OUT;
+
+// FSCTL_QUERY_USN_JOURNAL passthrough.
+typedef struct _WINTERNAL_NTFS_USN_JOURNAL_OUT {
+    UINT64 JournalId;
+    INT64  FirstUsn;
+    INT64  NextUsn;
+    INT64  LowestValidUsn;
+    INT64  MaxUsn;
+    UINT64 MaxSize;
+    UINT64 AllocationDelta;
+} WINTERNAL_NTFS_USN_JOURNAL_OUT, *PWINTERNAL_NTFS_USN_JOURNAL_OUT;
+
+// FSCTL_READ_USN_JOURNAL passthrough. Output: first 8 bytes are the
+// next-USN cursor (signed); the rest is a packed array of USN_RECORD_V2
+// — user-mode parses them.
+typedef struct _WINTERNAL_NTFS_USN_READ_IN {
+    WCHAR  Device[WINTERNAL_NTFS_DEV_NAME_MAX];
+    UINT64 JournalId;
+    INT64  StartUsn;
+    UINT32 ReasonMask;
+    UINT32 WaitForFresh;       // 0 = snapshot, 1 = block until new data
+} WINTERNAL_NTFS_USN_READ_IN, *PWINTERNAL_NTFS_USN_READ_IN;
+
+// FSCTL_ENUM_USN_DATA passthrough. Output: first 8 bytes are the
+// next-FRN cursor; the rest is packed USN_RECORD_V2.
+typedef struct _WINTERNAL_NTFS_MFT_ENUM_IN {
+    WCHAR  Device[WINTERNAL_NTFS_DEV_NAME_MAX];
+    UINT64 StartFrn;
+} WINTERNAL_NTFS_MFT_ENUM_IN, *PWINTERNAL_NTFS_MFT_ENUM_IN;
+
+// FileStreamInformation passthrough. Output: packed FILE_STREAM_INFORMATION
+// records; user-mode walks NextEntryOffset chain.
+typedef struct _WINTERNAL_NTFS_STREAMS_IN {
+    WCHAR Path[WINTERNAL_NTFS_PATH_MAX];   // NT path like L"\\??\\C:\\Users\\..."
+} WINTERNAL_NTFS_STREAMS_IN, *PWINTERNAL_NTFS_STREAMS_IN;
+
 typedef struct _WINTERNAL_SIGLEVEL_IN {
     UINT32 Pid;
     UINT8  SignatureLevel;       // SE_SIGNING_LEVEL_*

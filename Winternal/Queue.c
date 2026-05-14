@@ -476,18 +476,20 @@ static NTSTATUS WinternalKmemRead(
     _Out_writes_bytes_(Length) PVOID OutBuffer)
 {
     NTSTATUS s = STATUS_SUCCESS;
+    BOOLEAN  valid = MmIsAddressValid(KernelAddress);
+    UNREFERENCED_PARAMETER(valid);   // referenced only when DBG/KdPrintEx is live
     __try {
-        // Best-effort PTE probe before the actual copy. Not sufficient on its
-        // own (pageable kernel addresses may show invalid here yet succeed
-        // after a fault), so we still SEH-wrap the copy itself.
-        if (!MmIsAddressValid(KernelAddress)) {
-            // Don't reject — try the copy and let the fault tell us. This lets
-            // callers read paged data they reasonably expect to be resident.
-        }
+        // Best-effort PTE probe (`valid` above). Not sufficient on its own —
+        // pageable kernel addresses may show invalid here yet succeed after
+        // a soft fault — so we still SEH-wrap the actual copy.
         RtlCopyMemory(OutBuffer, KernelAddress, Length);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         s = GetExceptionCode();
     }
+    // Best-effort diagnostic; DbgPrint is stripped in non-DBG Release builds.
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "[winternal] kread @ %p len=%u valid=%u status=0x%08X\n",
+               KernelAddress, Length, valid, s);
     return s;
 }
 
@@ -566,13 +568,22 @@ static NTSTATUS HandleKmemRead(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t O
 {
     if (InLen < sizeof(WINTERNAL_KMEM_READ_IN)) return STATUS_BUFFER_TOO_SMALL;
     PWINTERNAL_KMEM_READ_IN in = (PWINTERNAL_KMEM_READ_IN)InBuf;
-    if (in->Length == 0 || in->Length > WINTERNAL_KMEM_MAX_BYTES) return STATUS_INVALID_PARAMETER;
-    if (OutLen < in->Length) return STATUS_BUFFER_TOO_SMALL;
-    PVOID kaddr = (PVOID)(ULONG_PTR)in->Address;
+    // METHOD_BUFFERED routes input + output through one shared SystemBuffer;
+    // writing to OutBuf clobbers InBuf. Pull every field into a local
+    // BEFORE the copy so post-copy reads of `in->...` don't see overwritten
+    // bytes (the source-of-truth for *Written, for example).
+    ULONG  length = in->Length;
+    UINT64 addrU  = in->Address;
+    if (length == 0 || length > WINTERNAL_KMEM_MAX_BYTES) return STATUS_INVALID_PARAMETER;
+    if (OutLen < length) return STATUS_BUFFER_TOO_SMALL;
+    PVOID kaddr = (PVOID)(ULONG_PTR)addrU;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "[winternal] HandleKmemRead in: addr=0x%llx len=%u outbuf=%p outlen=%zu\n",
+               addrU, length, OutBuf, OutLen);
     if (!WinternalIsKernelAddress(kaddr)) return STATUS_ACCESS_VIOLATION;
 
-    NTSTATUS s = WinternalKmemRead(kaddr, in->Length, OutBuf);
-    if (NT_SUCCESS(s)) *Written = in->Length;
+    NTSTATUS s = WinternalKmemRead(kaddr, length, OutBuf);
+    if (NT_SUCCESS(s)) *Written = length;
     return s;
 }
 
@@ -2146,6 +2157,12 @@ static NTSTATUS HandleKhookUninstall(PVOID, size_t);
 static NTSTATUS HandleLockdownEngage(PVOID, size_t, size_t*);
 static NTSTATUS HandleLockdownStatus(PVOID, size_t, size_t*);
 static NTSTATUS HandleAuditTail(PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsRawRead(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsVolData(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsUsnQuery(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsUsnRead(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsMftEnum(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleNtfsStreams(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleForceUnload(PVOID, size_t);
 static NTSTATUS HandleKdrvRegister(PVOID, size_t);
 static NTSTATUS HandleKdrvDeregister(PVOID, size_t);
@@ -2850,6 +2867,101 @@ static int KluaKdrvLoadBinding(lua_State* L)       { return KluaKdrvNameOpBindin
 static int KluaKdrvUnloadBinding(lua_State* L)     { return KluaKdrvNameOpBinding_(L, "kdrv_unload",     HandleKdrvUnload); }
 static int KluaKdrvDeregisterBinding(lua_State* L) { return KluaKdrvNameOpBinding_(L, "kdrv_deregister", HandleKdrvDeregister); }
 
+// ---- wnk.ntfs_raw_read(device, offset, length) -> bytes or nil ----
+//
+// Raw bytes from a device object — typically `\Device\HarddiskVolume3`
+// for a volume, or `\Device\PhysicalDriveN` for a whole disk. PreviousMode
+// = Kernel, so the read bypasses every minifilter / hook above NTFS in
+// the device stack. Capped at WINTERNAL_NTFS_RAW_MAX (1 MiB) per call.
+static int KluaNtfsRawRead(lua_State* L) {
+    WINTERNAL_NTFS_RAW_READ_IN in = {0};
+    KluaStringToWide(L, 1, in.Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+    in.Offset = (UINT64)luaL_checkinteger(L, 2);
+    in.Length = (UINT32)luaL_checkinteger(L, 3);
+    if (in.Length == 0 || in.Length > WINTERNAL_NTFS_RAW_MAX)
+        return luaL_error(L, "wnk.ntfs_raw_read: bad length (1..%u)", WINTERNAL_NTFS_RAW_MAX);
+
+    PVOID outBuf = ExAllocatePool2(POOL_FLAG_PAGED, in.Length, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!outBuf) return luaL_error(L, "wnk.ntfs_raw_read: out of pool memory");
+    size_t got = 0;
+    NTSTATUS s = HandleNtfsRawRead(&in, sizeof(in), outBuf, in.Length, &got);
+    if (!NT_SUCCESS(s)) {
+        ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+        return luaL_error(L, "wnk.ntfs_raw_read: NTSTATUS 0x%X", (unsigned)s);
+    }
+    lua_pushlstring(L, (const char*)outBuf, got);
+    ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+    return 1;
+}
+
+// ---- wnk.ntfs_usn_query(device) -> table ----
+static int KluaNtfsUsnQuery(lua_State* L) {
+    WINTERNAL_NTFS_DEVICE_IN in = {0};
+    KluaStringToWide(L, 1, in.Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+    WINTERNAL_NTFS_USN_JOURNAL_OUT out = {0};
+    size_t w = 0;
+    KluaCheckNt(L, "ntfs_usn_query", HandleNtfsUsnQuery(&in, sizeof(in), &out, sizeof(out), &w));
+    lua_createtable(L, 0, 7);
+    lua_pushinteger(L, (lua_Integer)out.JournalId);       lua_setfield(L, -2, "journalId");
+    lua_pushinteger(L, (lua_Integer)out.FirstUsn);        lua_setfield(L, -2, "firstUsn");
+    lua_pushinteger(L, (lua_Integer)out.NextUsn);         lua_setfield(L, -2, "nextUsn");
+    lua_pushinteger(L, (lua_Integer)out.LowestValidUsn);  lua_setfield(L, -2, "lowestValidUsn");
+    lua_pushinteger(L, (lua_Integer)out.MaxUsn);          lua_setfield(L, -2, "maxUsn");
+    lua_pushinteger(L, (lua_Integer)out.MaxSize);         lua_setfield(L, -2, "maxSize");
+    lua_pushinteger(L, (lua_Integer)out.AllocationDelta); lua_setfield(L, -2, "allocationDelta");
+    return 1;
+}
+
+// ---- wnk.ntfs_usn_read(device, journalId, startUsn, reasonMask, waitForFresh) -> raw blob ----
+static int KluaNtfsUsnRead(lua_State* L) {
+    WINTERNAL_NTFS_USN_READ_IN in = {0};
+    KluaStringToWide(L, 1, in.Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+    in.JournalId    = (UINT64)luaL_checkinteger(L, 2);
+    in.StartUsn     = (INT64) luaL_checkinteger(L, 3);
+    in.ReasonMask   = (UINT32)luaL_optinteger(L, 4, 0xFFFFFFFF);
+    in.WaitForFresh = lua_toboolean(L, 5) ? 1 : 0;
+    PVOID outBuf = ExAllocatePool2(POOL_FLAG_PAGED, WINTERNAL_NTFS_USN_BUF, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!outBuf) return luaL_error(L, "wnk.ntfs_usn_read: out of pool memory");
+    size_t got = 0;
+    NTSTATUS s = HandleNtfsUsnRead(&in, sizeof(in), outBuf, WINTERNAL_NTFS_USN_BUF, &got);
+    if (!NT_SUCCESS(s)) { ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+        return luaL_error(L, "wnk.ntfs_usn_read: NTSTATUS 0x%X", (unsigned)s); }
+    lua_pushlstring(L, (const char*)outBuf, got);
+    ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+    return 1;
+}
+
+// ---- wnk.ntfs_mft_enum(device, startFrn) -> raw blob ----
+static int KluaNtfsMftEnum(lua_State* L) {
+    WINTERNAL_NTFS_MFT_ENUM_IN in = {0};
+    KluaStringToWide(L, 1, in.Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+    in.StartFrn = (UINT64)luaL_optinteger(L, 2, 0);
+    PVOID outBuf = ExAllocatePool2(POOL_FLAG_PAGED, WINTERNAL_NTFS_USN_BUF, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!outBuf) return luaL_error(L, "wnk.ntfs_mft_enum: out of pool memory");
+    size_t got = 0;
+    NTSTATUS s = HandleNtfsMftEnum(&in, sizeof(in), outBuf, WINTERNAL_NTFS_USN_BUF, &got);
+    if (!NT_SUCCESS(s)) { ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+        return luaL_error(L, "wnk.ntfs_mft_enum: NTSTATUS 0x%X", (unsigned)s); }
+    lua_pushlstring(L, (const char*)outBuf, got);
+    ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+    return 1;
+}
+
+// ---- wnk.ntfs_streams(ntPath) -> raw FILE_STREAM_INFORMATION blob ----
+static int KluaNtfsStreams(lua_State* L) {
+    WINTERNAL_NTFS_STREAMS_IN in = {0};
+    KluaStringToWide(L, 1, in.Path, WINTERNAL_NTFS_PATH_MAX);
+    PVOID outBuf = ExAllocatePool2(POOL_FLAG_PAGED, 64 * 1024, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!outBuf) return luaL_error(L, "wnk.ntfs_streams: out of pool memory");
+    size_t got = 0;
+    NTSTATUS s = HandleNtfsStreams(&in, sizeof(in), outBuf, 64 * 1024, &got);
+    if (!NT_SUCCESS(s)) { ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+        return luaL_error(L, "wnk.ntfs_streams: NTSTATUS 0x%X", (unsigned)s); }
+    lua_pushlstring(L, (const char*)outBuf, got);
+    ExFreePoolWithTag(outBuf, WINTERNAL_POOL_TAG_DEFAULT);
+    return 1;
+}
+
 // ---- wnk.kdrv_set_start(name, startType) ----
 static int KluaKdrvSetStartBinding(lua_State* L) {
     KluaLockdownBlock(L, "kdrv_set_start");
@@ -2923,6 +3035,12 @@ void KluaRegisterWnk(lua_State* L) {
         {"lockdown_engage",  KluaLockdownEngageBinding},
         {"lockdown_status",  KluaLockdownStatusBinding},
         {"audit_tail",       KluaAuditTailBinding},
+        // ntfs / raw disk
+        {"ntfs_raw_read",    KluaNtfsRawRead},
+        {"ntfs_usn_query",   KluaNtfsUsnQuery},
+        {"ntfs_usn_read",    KluaNtfsUsnRead},
+        {"ntfs_mft_enum",    KluaNtfsMftEnum},
+        {"ntfs_streams",     KluaNtfsStreams},
         // driver lifecycle
         {"force_unload",     KluaForceUnloadBinding},
         {"kdrv_register",    KluaKdrvRegisterBinding},
@@ -3218,6 +3336,258 @@ static NTSTATUS HandleKdrvUnload(PVOID InBuf, size_t InLen)
     return ZwUnloadDriver(&svcPath);
 }
 
+// FSCTL codes + ZwFsControlFile prototype declared locally so we don't
+// pull in <ntifs.h> (which conflicts with the KMDF includes the rest of
+// this driver already pulls in via driver.h). The numeric codes match
+// ntifs.h byte-for-byte; see WDK ntifs.h or MS-FSA reference for the
+// authoritative definitions.
+#ifndef FSCTL_GET_NTFS_VOLUME_DATA
+#define FSCTL_GET_NTFS_VOLUME_DATA  CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef FSCTL_QUERY_USN_JOURNAL
+#define FSCTL_QUERY_USN_JOURNAL     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 61, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef FSCTL_READ_USN_JOURNAL
+#define FSCTL_READ_USN_JOURNAL      CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 46, METHOD_NEITHER,  FILE_ANY_ACCESS)
+#endif
+#ifndef FSCTL_ENUM_USN_DATA
+#define FSCTL_ENUM_USN_DATA         CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 44, METHOD_NEITHER,  FILE_ANY_ACCESS)
+#endif
+
+NTSYSAPI NTSTATUS NTAPI ZwFsControlFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock, ULONG FsControlCode,
+    PVOID InputBuffer, ULONG InputBufferLength,
+    PVOID OutputBuffer, ULONG OutputBufferLength);
+
+// Open a kernel device or NTFS path with PreviousMode = Kernel + the
+// OBJ_KERNEL_HANDLE flag (so it never appears in a user handle table).
+// Used by every NTFS handler below; the kernel-side open is what makes
+// the subsequent FSCTL/Read bypass per-process / per-mode minifilters.
+static NTSTATUS NtfsOpenK(PCWSTR name, ACCESS_MASK access, BOOLEAN forCreate, HANDLE* outH)
+{
+    UNICODE_STRING us;
+    RtlInitUnicodeString(&us, name);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    IO_STATUS_BLOCK iosb;
+    return ZwCreateFile(outH, access | SYNCHRONIZE, &oa, &iosb, NULL,
+                        FILE_ATTRIBUTE_NORMAL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        forCreate ? FILE_OPEN_IF : FILE_OPEN,
+                        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+}
+
+// Helper: clamp + NUL-terminate a fixed WCHAR buffer in place.
+static void NtfsClampWcs(WCHAR* p, size_t maxChars) {
+    p[maxChars - 1] = 0;
+}
+
+// Raw read from a device object (volume, physical disk, etc.). The
+// driver opens the named device with FILE_READ_DATA and reads at the
+// caller-supplied offset, bypassing every filter above NTFS in the
+// device stack — useful for parsing on-disk structures (MFT, $LogFile,
+// boot sector) without trusting anything user-mode-hookable.
+static NTSTATUS HandleNtfsRawRead(PVOID InBuf, size_t InLen,
+                                  PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_NTFS_RAW_READ_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_RAW_READ_IN in = (PWINTERNAL_NTFS_RAW_READ_IN)InBuf;
+    if (in->Length == 0 || in->Length > WINTERNAL_NTFS_RAW_MAX) return STATUS_INVALID_PARAMETER;
+    if (OutLen < in->Length) return STATUS_BUFFER_TOO_SMALL;
+
+    // Guarantee NUL-terminated device name (within the fixed buffer).
+    WCHAR devName[WINTERNAL_NTFS_DEV_NAME_MAX + 1];
+    RtlZeroMemory(devName, sizeof(devName));
+    RtlCopyMemory(devName, in->Device, sizeof(in->Device));
+
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, devName);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE h = NULL;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS s = ZwCreateFile(&h, FILE_READ_DATA | SYNCHRONIZE, &oa, &iosb, NULL,
+                              FILE_ATTRIBUTE_NORMAL,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(s)) return s;
+
+    LARGE_INTEGER off;
+    off.QuadPart = (LONGLONG)in->Offset;
+    RtlZeroMemory(&iosb, sizeof(iosb));
+    s = ZwReadFile(h, NULL, NULL, NULL, &iosb, OutBuf, in->Length, &off, NULL);
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+    *Written = iosb.Information;
+    return STATUS_SUCCESS;
+}
+
+// ---- FSCTL_GET_NTFS_VOLUME_DATA ----
+static NTSTATUS HandleNtfsVolData(PVOID InBuf, size_t InLen,
+                                  PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_NTFS_DEVICE_IN))    return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_NTFS_VOL_DATA_OUT)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_DEVICE_IN in = (PWINTERNAL_NTFS_DEVICE_IN)InBuf;
+    NtfsClampWcs(in->Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+
+    HANDLE h = NULL;
+    NTSTATUS s = NtfsOpenK(in->Device, FILE_READ_DATA, FALSE, &h);
+    if (!NT_SUCCESS(s)) return s;
+
+    IO_STATUS_BLOCK iosb = {0};
+    s = ZwFsControlFile(h, NULL, NULL, NULL, &iosb,
+                        FSCTL_GET_NTFS_VOLUME_DATA, NULL, 0, OutBuf,
+                        (ULONG)OutLen);
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+    *Written = iosb.Information ? iosb.Information : sizeof(WINTERNAL_NTFS_VOL_DATA_OUT);
+    return STATUS_SUCCESS;
+}
+
+// ---- FSCTL_QUERY_USN_JOURNAL ----
+static NTSTATUS HandleNtfsUsnQuery(PVOID InBuf, size_t InLen,
+                                   PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_NTFS_DEVICE_IN))     return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_NTFS_USN_JOURNAL_OUT)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_DEVICE_IN  in  = (PWINTERNAL_NTFS_DEVICE_IN)InBuf;
+    PWINTERNAL_NTFS_USN_JOURNAL_OUT out = (PWINTERNAL_NTFS_USN_JOURNAL_OUT)OutBuf;
+    NtfsClampWcs(in->Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+
+    HANDLE h = NULL;
+    NTSTATUS s = NtfsOpenK(in->Device, FILE_READ_DATA, FALSE, &h);
+    if (!NT_SUCCESS(s)) return s;
+
+    // The kernel returns USN_JOURNAL_DATA_V2 (about 80 bytes); allocate
+    // generously so newer Windows versions with V3 don't truncate.
+    UCHAR jd[256] = {0};
+    IO_STATUS_BLOCK iosb = {0};
+    s = ZwFsControlFile(h, NULL, NULL, NULL, &iosb,
+                        FSCTL_QUERY_USN_JOURNAL, NULL, 0, jd, sizeof(jd));
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+
+    // V2 layout (compatible with V1 prefix). Cast at fixed offsets so we
+    // don't pull in the ntifs.h struct definitions here.
+    RtlCopyMemory(&out->JournalId,       jd + 0x00, sizeof(UINT64));
+    RtlCopyMemory(&out->FirstUsn,        jd + 0x08, sizeof(INT64));
+    RtlCopyMemory(&out->NextUsn,         jd + 0x10, sizeof(INT64));
+    RtlCopyMemory(&out->LowestValidUsn,  jd + 0x18, sizeof(INT64));
+    RtlCopyMemory(&out->MaxUsn,          jd + 0x20, sizeof(INT64));
+    RtlCopyMemory(&out->MaxSize,         jd + 0x28, sizeof(UINT64));
+    RtlCopyMemory(&out->AllocationDelta, jd + 0x30, sizeof(UINT64));
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+// Kernel-side layout of READ_USN_JOURNAL_DATA_V1 (96 bytes).
+typedef struct {
+    INT64  StartUsn;
+    UINT32 ReasonMask;
+    UINT32 ReturnOnlyOnClose;
+    UINT64 Timeout;
+    UINT64 BytesToWaitFor;
+    UINT64 UsnJournalID;
+    UINT16 MinMajorVersion;
+    UINT16 MaxMajorVersion;
+    UINT8  _pad[8];
+} READ_USN_V1_LOCAL;
+
+// ---- FSCTL_READ_USN_JOURNAL ----
+static NTSTATUS HandleNtfsUsnRead(PVOID InBuf, size_t InLen,
+                                  PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_NTFS_USN_READ_IN)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < 8)                                   return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_USN_READ_IN in = (PWINTERNAL_NTFS_USN_READ_IN)InBuf;
+    NtfsClampWcs(in->Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+
+    HANDLE h = NULL;
+    NTSTATUS s = NtfsOpenK(in->Device, FILE_READ_DATA, FALSE, &h);
+    if (!NT_SUCCESS(s)) return s;
+
+    READ_USN_V1_LOCAL req = {0};
+    req.StartUsn        = in->StartUsn;
+    req.ReasonMask      = in->ReasonMask ? in->ReasonMask : 0xFFFFFFFF;
+    req.BytesToWaitFor  = in->WaitForFresh ? 1 : 0;
+    req.UsnJournalID    = in->JournalId;
+    req.MinMajorVersion = 2;
+    req.MaxMajorVersion = 2;
+
+    IO_STATUS_BLOCK iosb = {0};
+    s = ZwFsControlFile(h, NULL, NULL, NULL, &iosb,
+                        FSCTL_READ_USN_JOURNAL, &req, sizeof(req),
+                        OutBuf, (ULONG)OutLen);
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+    *Written = iosb.Information;
+    return STATUS_SUCCESS;
+}
+
+// Kernel-side layout of MFT_ENUM_DATA_V0 (24 bytes).
+typedef struct {
+    UINT64 StartFileReferenceNumber;
+    INT64  LowUsn;
+    INT64  HighUsn;
+} MFT_ENUM_V0_LOCAL;
+
+// ---- FSCTL_ENUM_USN_DATA ----
+static NTSTATUS HandleNtfsMftEnum(PVOID InBuf, size_t InLen,
+                                  PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_NTFS_MFT_ENUM_IN)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < 8)                                   return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_MFT_ENUM_IN in = (PWINTERNAL_NTFS_MFT_ENUM_IN)InBuf;
+    NtfsClampWcs(in->Device, WINTERNAL_NTFS_DEV_NAME_MAX);
+
+    HANDLE h = NULL;
+    NTSTATUS s = NtfsOpenK(in->Device, FILE_READ_DATA, FALSE, &h);
+    if (!NT_SUCCESS(s)) return s;
+
+    MFT_ENUM_V0_LOCAL req = {0};
+    req.StartFileReferenceNumber = in->StartFrn;
+    req.LowUsn  = 0;
+    req.HighUsn = MAXLONGLONG;
+
+    IO_STATUS_BLOCK iosb = {0};
+    s = ZwFsControlFile(h, NULL, NULL, NULL, &iosb,
+                        FSCTL_ENUM_USN_DATA, &req, sizeof(req),
+                        OutBuf, (ULONG)OutLen);
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+    *Written = iosb.Information;
+    return STATUS_SUCCESS;
+}
+
+// ---- FileStreamInformation ----
+// Returns the kernel's packed FILE_STREAM_INFORMATION records as a blob.
+// FileStreamInformation = 22.
+#define WN_FILE_STREAM_INFORMATION 22
+
+static NTSTATUS HandleNtfsStreams(PVOID InBuf, size_t InLen,
+                                  PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen < sizeof(WINTERNAL_NTFS_STREAMS_IN)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_NTFS_STREAMS_IN in = (PWINTERNAL_NTFS_STREAMS_IN)InBuf;
+    NtfsClampWcs(in->Path, WINTERNAL_NTFS_PATH_MAX);
+
+    HANDLE h = NULL;
+    NTSTATUS s = NtfsOpenK(in->Path, FILE_READ_ATTRIBUTES, FALSE, &h);
+    if (!NT_SUCCESS(s)) return s;
+
+    IO_STATUS_BLOCK iosb = {0};
+    s = ZwQueryInformationFile(h, &iosb, OutBuf, (ULONG)OutLen,
+                               (FILE_INFORMATION_CLASS)WN_FILE_STREAM_INFORMATION);
+    ZwClose(h);
+    if (!NT_SUCCESS(s)) return s;
+    *Written = iosb.Information;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS HandleAuditTail(PVOID OutBuf, size_t OutLen, size_t* Written)
 {
     size_t header = FIELD_OFFSET(WINTERNAL_AUDIT_OUT, Rows);
@@ -3449,6 +3819,24 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
         break;
     case IOCTL_WINTERNAL_AUDIT_TAIL:
         status = HandleAuditTail(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_RAW_READ:
+        status = HandleNtfsRawRead(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_VOL_DATA:
+        status = HandleNtfsVolData(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_USN_QUERY:
+        status = HandleNtfsUsnQuery(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_USN_READ:
+        status = HandleNtfsUsnRead(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_MFT_ENUM:
+        status = HandleNtfsMftEnum(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_NTFS_STREAMS:
+        status = HandleNtfsStreams(InBuf, InLen, OutBuf, OutLen, BytesWritten);
         break;
     case IOCTL_WINTERNAL_FORCE_UNLOAD_DRIVER:
         status = HandleForceUnload(InBuf, InLen);

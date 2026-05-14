@@ -265,6 +265,75 @@ int CmdSelftest() {
     auto audit = ds.auditTail(8);
     wprintf(L"  [ok ] audit_tail returned %zu rows\n", audit.size());
 
+    // ---- NTFS surface ----
+    // Pick the system volume (where Windows lives) so we have something
+    // reliable on every Windows install. Resolve drive -> NT device name
+    // and round-trip every NTFS IOCTL through DriverSession.
+    wchar_t winDir[MAX_PATH] = {};
+    ::GetWindowsDirectoryW(winDir, _countof(winDir));
+    std::wstring drive(winDir, 2);                      // "C:"
+    wchar_t devBuf[MAX_PATH] = {};
+    DWORD devN = ::QueryDosDeviceW(drive.c_str(), devBuf, _countof(devBuf));
+    if (!devN) {
+        wprintf(L"  [warn] QueryDosDevice(%ls) failed (%lu) — skipping NTFS round-trip\n",
+                drive.c_str(), ::GetLastError());
+    } else {
+        std::wstring dev = devBuf;
+        wprintf(L"  ntfs:  %ls -> %ls\n", drive.c_str(), dev.c_str());
+
+        auto vd = ds.ntfsVolData(dev);
+        if (!vd)                       return fail(L"NTFS_VOL_DATA",  "FSCTL passthrough failed");
+        if (vd->bytesPerSector == 0)   return fail(L"NTFS_VOL_DATA",  "bytesPerSector=0");
+        wprintf(L"  [ok ] NTFS_VOL_DATA   sector=%u cluster=%u mftLcn=0x%llx mftSize=%llu\n",
+                vd->bytesPerSector, vd->bytesPerCluster,
+                (unsigned long long)vd->mftStartLcn,
+                (unsigned long long)vd->mftValidDataLength);
+
+        auto uj = ds.ntfsUsnQuery(dev);
+        if (!uj)                       return fail(L"NTFS_USN_QUERY", "no active journal");
+        if (uj->journalId == 0)        return fail(L"NTFS_USN_QUERY", "journalId=0");
+        wprintf(L"  [ok ] NTFS_USN_QUERY  id=%llu first=%lld next=%lld\n",
+                (unsigned long long)uj->journalId, uj->firstUsn, uj->nextUsn);
+
+        auto usn = ds.ntfsUsnRead(dev, uj->journalId, uj->firstUsn, 0xFFFFFFFF, false);
+        if (!usn)                      return fail(L"NTFS_USN_READ",  "read returned nullopt");
+        if (usn->size() < 8)           return fail(L"NTFS_USN_READ",  "short response (<8 bytes)");
+        wprintf(L"  [ok ] NTFS_USN_READ   %zu bytes (next-USN cursor + records)\n", usn->size());
+
+        auto mft = ds.ntfsMftEnum(dev, 0);
+        if (!mft)                      return fail(L"NTFS_MFT_ENUM",  "FSCTL passthrough failed");
+        if (mft->size() < 16)          return fail(L"NTFS_MFT_ENUM",  "short response");
+        wprintf(L"  [ok ] NTFS_MFT_ENUM   %zu bytes from first batch\n", mft->size());
+
+        // FILE_STREAM_INFORMATION on Windows itself — guaranteed to exist.
+        std::wstring ntPath = L"\\??\\";
+        ntPath += winDir;
+        auto streams = ds.ntfsStreams(ntPath);
+        if (!streams)                  return fail(L"NTFS_STREAMS",   "FileStreamInformation returned nullopt");
+        wprintf(L"  [ok ] NTFS_STREAMS    %zu bytes for %ls\n", streams->size(), ntPath.c_str());
+
+        // Raw read of the volume boot sector. NTFS BPB has "NTFS    " at
+        // offset 3; if we don't see it, the raw-read path is broken.
+        auto boot = ds.ntfsRawRead(dev, 0, 512);
+        if (!boot)                     return fail(L"NTFS_RAW_READ",  "ZwReadFile returned nullopt");
+        if (boot->size() < 512)        return fail(L"NTFS_RAW_READ",  "short read (<512 bytes)");
+        const char* oem = reinterpret_cast<const char*>(boot->data() + 3);
+        if (std::strncmp(oem, "NTFS", 4) != 0)
+                                       return fail(L"NTFS_RAW_READ",  "boot-sector OEM-id != 'NTFS'");
+        wprintf(L"  [ok ] NTFS_RAW_READ   512 bytes @ 0; OEM-id='NTFS'\n");
+
+        // wnk.* binding round-trip — confirm the Lua surface mirrors the
+        // C++ DriverSession surface (catches registry-table typos).
+        std::string script =
+            "local q = wnk.ntfs_usn_query([[" + std::string(dev.begin(), dev.end()) + "]])\n"
+            "print('lua sees journalId='..tostring(q.journalId))\n";
+        // ^ the dev path contains only ASCII; widechar->narrow trivially.
+        auto lua2 = ds.luaExec(script);
+        if (!lua2 || lua2->luaStatus != 0)
+            return fail(L"wnk.ntfs_usn_query", "kernel-Lua binding round-trip failed");
+        wprintf(L"  [ok ] wnk.ntfs_usn_query (lua binding)\n");
+    }
+
     wprintf(L"\nselftest: all checks passed.\n");
     return 0;
 }

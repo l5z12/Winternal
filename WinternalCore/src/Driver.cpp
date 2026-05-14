@@ -390,6 +390,122 @@ bool DriverSession::kdrvSetStart(std::wstring_view name, uint32_t startType) {
     return ioctl_(IOCTL_WINTERNAL_KDRV_SET_START, &in, sizeof(in), nullptr, 0, nullptr);
 }
 
+std::optional<DriverSession::NtfsVolData>
+DriverSession::ntfsVolData(std::wstring_view device) {
+    WINTERNAL_NTFS_DEVICE_IN in{};
+    if (!FillName(in.Device, WINTERNAL_NTFS_DEV_NAME_MAX, device)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_NTFS_VOL_DATA_OUT out{};
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_VOL_DATA, &in, sizeof(in),
+                &out, sizeof(out), &ret)) return std::nullopt;
+    NtfsVolData d{};
+    d.serial                       = (uint64_t)out.VolumeSerialNumber.QuadPart;
+    d.numberSectors                = (uint64_t)out.NumberSectors.QuadPart;
+    d.totalClusters                = (uint64_t)out.TotalClusters.QuadPart;
+    d.freeClusters                 = (uint64_t)out.FreeClusters.QuadPart;
+    d.totalReserved                = (uint64_t)out.TotalReserved.QuadPart;
+    d.bytesPerSector               = out.BytesPerSector;
+    d.bytesPerCluster              = out.BytesPerCluster;
+    d.bytesPerFileRecordSegment    = out.BytesPerFileRecordSegment;
+    d.clustersPerFileRecordSegment = out.ClustersPerFileRecordSegment;
+    d.mftValidDataLength           = (uint64_t)out.MftValidDataLength.QuadPart;
+    d.mftStartLcn                  = (uint64_t)out.MftStartLcn.QuadPart;
+    d.mft2StartLcn                 = (uint64_t)out.Mft2StartLcn.QuadPart;
+    d.mftZoneStart                 = (uint64_t)out.MftZoneStart.QuadPart;
+    d.mftZoneEnd                   = (uint64_t)out.MftZoneEnd.QuadPart;
+    return d;
+}
+
+std::optional<DriverSession::UsnJournal>
+DriverSession::ntfsUsnQuery(std::wstring_view device) {
+    WINTERNAL_NTFS_DEVICE_IN in{};
+    if (!FillName(in.Device, WINTERNAL_NTFS_DEV_NAME_MAX, device)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_NTFS_USN_JOURNAL_OUT out{};
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_USN_QUERY, &in, sizeof(in),
+                &out, sizeof(out), &ret)) return std::nullopt;
+    UsnJournal j{};
+    j.journalId       = out.JournalId;
+    j.firstUsn        = out.FirstUsn;
+    j.nextUsn         = out.NextUsn;
+    j.lowestValidUsn  = out.LowestValidUsn;
+    j.maxUsn          = out.MaxUsn;
+    j.maxSize         = out.MaxSize;
+    j.allocationDelta = out.AllocationDelta;
+    return j;
+}
+
+std::optional<std::vector<uint8_t>>
+DriverSession::ntfsUsnRead(std::wstring_view device, uint64_t journalId,
+                           int64_t startUsn, uint32_t reasonMask, bool waitForFresh) {
+    WINTERNAL_NTFS_USN_READ_IN in{};
+    if (!FillName(in.Device, WINTERNAL_NTFS_DEV_NAME_MAX, device)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    in.JournalId    = journalId;
+    in.StartUsn     = startUsn;
+    in.ReasonMask   = reasonMask;
+    in.WaitForFresh = waitForFresh ? 1 : 0;
+    std::vector<uint8_t> out(WINTERNAL_NTFS_USN_BUF);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_USN_READ, &in, sizeof(in),
+                out.data(), (uint32_t)out.size(), &ret)) return std::nullopt;
+    out.resize(ret);
+    return out;
+}
+
+std::optional<std::vector<uint8_t>>
+DriverSession::ntfsMftEnum(std::wstring_view device, uint64_t startFrn) {
+    WINTERNAL_NTFS_MFT_ENUM_IN in{};
+    if (!FillName(in.Device, WINTERNAL_NTFS_DEV_NAME_MAX, device)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    in.StartFrn = startFrn;
+    std::vector<uint8_t> out(WINTERNAL_NTFS_USN_BUF);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_MFT_ENUM, &in, sizeof(in),
+                out.data(), (uint32_t)out.size(), &ret)) return std::nullopt;
+    out.resize(ret);
+    return out;
+}
+
+std::optional<std::vector<uint8_t>>
+DriverSession::ntfsStreams(std::wstring_view ntPath) {
+    WINTERNAL_NTFS_STREAMS_IN in{};
+    if (!FillName(in.Path, WINTERNAL_NTFS_PATH_MAX, ntPath)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    std::vector<uint8_t> out(64 * 1024);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_STREAMS, &in, sizeof(in),
+                out.data(), (uint32_t)out.size(), &ret)) return std::nullopt;
+    out.resize(ret);
+    return out;
+}
+
+std::optional<std::vector<uint8_t>>
+DriverSession::ntfsRawRead(std::wstring_view device, uint64_t offset, uint32_t length) {
+    if (length == 0 || length > WINTERNAL_NTFS_RAW_MAX) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_NTFS_RAW_READ_IN in{};
+    if (!FillName(in.Device, WINTERNAL_NTFS_DEV_NAME_MAX, device)) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    in.Offset = offset;
+    in.Length = length;
+    std::vector<uint8_t> out(length);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_NTFS_RAW_READ, &in, sizeof(in),
+                out.data(), length, &ret)) return std::nullopt;
+    out.resize(ret);
+    return out;
+}
+
 std::vector<DriverSession::AuditRow> DriverSession::auditTail(uint32_t maxRows) {
     std::vector<AuditRow> out;
     if (maxRows == 0) return out;

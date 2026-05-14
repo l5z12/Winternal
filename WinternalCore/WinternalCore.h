@@ -10,3 +10,4 @@
 #include "src/ObjectDir.h"
 #include "src/Hook.h"
 #include "src/Driver.h"
+#include "src/Ntfs.h"

@@ -167,7 +167,15 @@ Service management (admin):
 Driver management (admin):
   drv list | start | stop | enable | disable | delete <name>
   drv load <name> <sys-path>
-  drv unload <name>                     force unload via Winternal.sys (bypasses SCM)
+  drv unload <name>                     force unload via Winternal.sys
+
+NTFS monitoring + analyzing:
+  ntfs vols                             NTFS volumes + cluster/MFT metadata
+  ntfs usn <vol> [--tail] [--count N]   USN journal snapshot or live tail
+  ntfs mft <vol> [--limit N] [--name S] MFT walk via FSCTL_ENUM_USN_DATA
+  ntfs streams <path>                   alternate data streams (ADS)
+  ntfs compare <path>                   FindFirstFile vs MFT diff (hide detect)
+  ntfs raw <device> <off> <len>         driver-backed raw read (bypasses minifilters) (bypasses SCM)
 
 Plugins:
   plugin list                        plugin info <name>
@@ -228,6 +236,12 @@ an IOCTL round-trip per primitive. Grouped:
 
 - **basics** — `print`, `ksym`, `modksym`, `module`, `scan`, `kread`,
   `kreadstr`, `kwrite`, `kalloc`, `kfree`, `pids`
+- **ntfs / fs** — `ntfs_raw_read` (raw bytes from any kernel device),
+  `ntfs_usn_query` / `ntfs_usn_read` (USN journal), `ntfs_mft_enum`
+  (MFT walk via FSCTL_ENUM_USN_DATA), `ntfs_streams`
+  (FileStreamInformation). All open their target with
+  `PreviousMode = Kernel`, so the underlying FSCTL hits NTFS unfiltered
+  by per-process / per-access-mode minifilters.
 - **call + EPROCESS field tools** — `kcall`, `unprotect`, `kill`,
   `protect_lock`, `protect_unlock`, `protect_list`, `set_siglevel`,
   `token_uiaccess`, `kcode_patch`, `get_true_stub`, `get_w32proc`
@@ -450,6 +464,8 @@ state file across the disable / revert cycle.
 | `AUDIT_TAIL`                         | read last N audit rows                        |
 | `FORCE_UNLOAD_DRIVER`                | resolve `\Driver\<name>` + call DriverUnload  |
 | `KDRV_REGISTER / LOAD / UNLOAD / DEREGISTER / SET_START` | SCM-bypassing driver lifecycle (ZwLoadDriver + reg writes) |
+| `NTFS_RAW_READ`                      | ZwReadFile on a `\Device\*` from kernel mode |
+| `NTFS_VOL_DATA / USN_QUERY / USN_READ / MFT_ENUM / STREAMS` | FSCTL passthrough via `ZwFsControlFile` + `ZwQueryInformationFile` (PreviousMode=Kernel) |
 
 Every state-mutating IOCTL is SEH-wrapped at the dispatcher level, audited
 into a 1024-row ring buffer, and refused once lockdown is engaged.

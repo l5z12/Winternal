@@ -62,6 +62,7 @@
     <ClCompile Include="WinternalLua.cpp" />
     <ClCompile Include="WinternalInstall.cpp" />
     <ClCompile Include="WinternalDriverMgmt.cpp" />
+    <ClCompile Include="WinternalNtfs.cpp" />
     <ClCompile Include="WinternalPlugins.cpp" />
     <ClCompile Include="Hook64.cpp" />
   </ItemGroup>

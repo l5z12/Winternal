@@ -206,6 +206,48 @@ public:
     bool kdrvDeregister(std::wstring_view name);
     bool kdrvSetStart(std::wstring_view name, uint32_t startType);
 
+    // Raw read from a kernel device path (typically L"\\Device\\HarddiskVolume3"
+    // for a volume or L"\\Device\\PhysicalDriveN" for the whole disk). The
+    // driver does the open + ZwReadFile in kernel mode, bypassing every
+    // minifilter / user-mode hook above NTFS. Caller-chosen length is
+    // capped server-side at 1 MiB. Empty on error.
+    std::optional<std::vector<uint8_t>> ntfsRawRead(std::wstring_view device,
+                                                    uint64_t offset, uint32_t length);
+
+    // NTFS FSCTL surface — every entry below opens the device or file
+    // inside the driver with PreviousMode=Kernel + OBJ_KERNEL_HANDLE,
+    // so the FSCTL hits NTFS unfiltered by user-mode minifilters.
+    struct NtfsVolData {
+        uint64_t serial;
+        uint64_t numberSectors, totalClusters, freeClusters, totalReserved;
+        uint32_t bytesPerSector, bytesPerCluster;
+        uint32_t bytesPerFileRecordSegment, clustersPerFileRecordSegment;
+        uint64_t mftValidDataLength, mftStartLcn, mft2StartLcn;
+        uint64_t mftZoneStart, mftZoneEnd;
+    };
+    std::optional<NtfsVolData> ntfsVolData(std::wstring_view device);
+
+    struct UsnJournal {
+        uint64_t journalId;
+        int64_t  firstUsn, nextUsn, lowestValidUsn, maxUsn;
+        uint64_t maxSize, allocationDelta;
+    };
+    std::optional<UsnJournal> ntfsUsnQuery(std::wstring_view device);
+
+    // Returns the raw output blob from FSCTL_READ_USN_JOURNAL: first 8
+    // bytes = next USN cursor, rest = USN_RECORD_V2 packed array.
+    std::optional<std::vector<uint8_t>>
+        ntfsUsnRead(std::wstring_view device, uint64_t journalId,
+                    int64_t startUsn, uint32_t reasonMask, bool waitForFresh);
+
+    // Same shape as ntfsUsnRead but driven by FSCTL_ENUM_USN_DATA.
+    std::optional<std::vector<uint8_t>>
+        ntfsMftEnum(std::wstring_view device, uint64_t startFrn);
+
+    // Raw FILE_STREAM_INFORMATION blob (NextEntryOffset chain).
+    std::optional<std::vector<uint8_t>>
+        ntfsStreams(std::wstring_view ntPath);
+
 private:
     HandleGuard handle_;
     bool ioctl_(uint32_t code, const void* in, uint32_t inLen, void* out, uint32_t outLen, uint32_t* bytesReturned);

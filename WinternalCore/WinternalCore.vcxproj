@@ -53,6 +53,7 @@
     <ClInclude Include="src\ObjectDir.h" />
     <ClInclude Include="src\Hook.h" />
     <ClInclude Include="src\Driver.h" />
+    <ClInclude Include="src\Ntfs.h" />
     <ClInclude Include="WinternalCore.h" />
   </ItemGroup>
   <ItemGroup>
@@ -66,6 +67,7 @@
     <ClCompile Include="src\ObjectDir.cpp" />
     <ClCompile Include="src\Hook.cpp" />
     <ClCompile Include="src\Driver.cpp" />
+    <ClCompile Include="src\Ntfs.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
