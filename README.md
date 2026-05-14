@@ -354,8 +354,27 @@ return {
 ```
 
 Per-plugin enable/disable state is persisted in
-`%APPDATA%\Winternal\plugins.lua`. `winternal plugin run <name>` always
-invokes a plugin explicitly. **Autorun behavior** for `winternal lua`
+`%APPDATA%\Winternal\plugins.lua`. `winternal plugin run <name>
+[args...]` always invokes a plugin explicitly; everything after the
+plugin name is exposed inside the script as the standard Lua `arg`
+table, so plugins implement their own subcommands / options:
+
+```powershell
+winternal plugin run pg_disable                # self-toggle
+winternal plugin run pg_disable status         # show current state
+winternal plugin run pg_disable pg-disable     # explicit disable
+winternal plugin run pg_disable pg-revert      # explicit revert
+```
+
+```lua
+-- inside main.lua
+local cmd = arg and arg[1]
+if cmd == "status" then ... end
+```
+
+Combine with `string.pack` / a small option parser in Lua for richer
+grammars. The manifest's `commands` array is purely descriptive — the
+plugin itself owns dispatch. **Autorun behavior** for `winternal lua`
 startup is opt-in per plugin via the `autorun` manifest field:
 
 - `lua-user` and `dll` — default `autorun = true`. These plugins

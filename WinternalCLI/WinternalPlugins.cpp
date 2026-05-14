@@ -332,6 +332,19 @@ bool HandleHostDirective(std::string_view line, std::string& actionsLog) {
 
 } // namespace
 
+// Write a narrow UTF-8 buffer to a wide-mode stdio stream. WinternalCLI
+// puts stdout/stderr in _O_U8TEXT (so `wprintf("...%ls...", ...)` works
+// for everything we own). Under that mode the CRT's byte-oriented `fwrite`
+// silently drops narrow data — convert through UTF-16 and use `fputws`.
+static void WriteUtf8Wide(FILE* out, std::string_view bytes) {
+    if (bytes.empty()) return;
+    int wlen = ::MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (wlen <= 0) return;
+    std::wstring w(wlen, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), w.data(), wlen);
+    fputws(w.c_str(), out);
+}
+
 void ProcessPluginOutput(std::string_view output, FILE* out, std::string& actionsLog) {
     size_t pos = 0;
     while (pos < output.size()) {
@@ -339,8 +352,8 @@ void ProcessPluginOutput(std::string_view output, FILE* out, std::string& action
         size_t end = (nl == std::string_view::npos) ? output.size() : nl;
         std::string_view line = output.substr(pos, end - pos);
         if (!HandleHostDirective(line, actionsLog)) {
-            fwrite(line.data(), 1, line.size(), out);
-            if (nl != std::string_view::npos) fputc('\n', out);
+            WriteUtf8Wide(out, line);
+            if (nl != std::string_view::npos) fputwc(L'\n', out);
         }
         if (nl == std::string_view::npos) break;
         pos = nl + 1;
@@ -403,7 +416,44 @@ int CmdPluginEnable(Registry& r, const wchar_t* name, bool on) {
     return 0;
 }
 
-int CmdPluginRun(Registry& r, const wchar_t* name) {
+// Quote a UTF-8 string as a Lua "..." literal — escape ", \, control bytes.
+// Used to splice plugin argv into a generated `arg = { ... }` prelude.
+static std::string LuaQuote(std::string_view s) {
+    std::string o; o.reserve(s.size() + 2);
+    o += '"';
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\')      { o += '\\'; o += (char)c; }
+        else if (c == '\n')             o += "\\n";
+        else if (c == '\r')             o += "\\r";
+        else if (c == '\0')             o += "\\0";
+        else if (c < 0x20 || c == 0x7F) {
+            char buf[8];
+            int n = std::snprintf(buf, sizeof(buf), "\\%u", (unsigned)c);
+            o.append(buf, n);
+        }
+        else                            o += (char)c;
+    }
+    o += '"';
+    return o;
+}
+
+// Build `local arg = { "a", "b", ... }\n` from a wide-char argv list.
+static std::string BuildArgPrelude(int argc, wchar_t** argv) {
+    std::string out = "local arg = {";
+    for (int i = 0; i < argc; ++i) {
+        if (!argv[i]) continue;
+        int n = ::WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 1) { out += (i ? ", \"\"" : "\"\""); continue; }
+        std::string u8(n - 1, '\0');
+        ::WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, u8.data(), n, nullptr, nullptr);
+        if (i) out += ", ";
+        out += LuaQuote(u8);
+    }
+    out += "}\n";
+    return out;
+}
+
+int CmdPluginRun(Registry& r, const wchar_t* name, int argc, wchar_t** argv) {
     char nameU8[256];
     ::WideCharToMultiByte(CP_UTF8, 0, name, -1, nameU8, sizeof(nameU8), nullptr, nullptr);
     const Manifest* m = r.find(nameU8);
@@ -414,18 +464,22 @@ int CmdPluginRun(Registry& r, const wchar_t* name) {
         std::ifstream in(entryPath, std::ios::binary);
         if (!in) { fwprintf(stderr, L"plugin: cannot read %s\n", entryPath.wstring().c_str()); return 1; }
         std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        // Prepend a generated `arg = {...}` table so the plugin can do its
+        // own subcommand / option handling. Lua convention; the manifest's
+        // `commands` array is purely descriptive — the plugin owns dispatch.
+        std::string full = BuildArgPrelude(argc, argv) + body;
         DriverSession ds;
         if (!ds.open()) {
             fwprintf(stderr, L"plugin: Winternal.sys not loaded (open failed: %lu)\n", ::GetLastError());
             return 1;
         }
-        auto res = ds.luaExec(body);
+        auto res = ds.luaExec(full);
         if (!res) {
             fwprintf(stderr, L"plugin: IOCTL_LUA_EXEC failed: %lu\n", ::GetLastError()); return 1;
         }
         std::string actions;
         if (!res->output.empty()) ProcessPluginOutput(res->output, stdout, actions);
-        if (!actions.empty()) fwrite(actions.data(), 1, actions.size(), stdout);
+        if (!actions.empty()) WriteUtf8Wide(stdout, actions);
         if (res->luaStatus != 0) {
             fwprintf(stderr, L"plugin: kernel lua status %d\n", res->luaStatus); return 1;
         }
@@ -452,7 +506,7 @@ int RunPluginCommand(int argc, wchar_t** argv) {
     if (sub == L"info")     return CmdPluginInfo(r, argv[1]);
     if (sub == L"enable")   return CmdPluginEnable(r, argv[1], true);
     if (sub == L"disable")  return CmdPluginEnable(r, argv[1], false);
-    if (sub == L"run")      return CmdPluginRun(r, argv[1]);
+    if (sub == L"run")      return CmdPluginRun(r, argv[1], argc - 2, argv + 2);
     fwprintf(stderr, L"plugin: unknown subcommand: %s\n", argv[0]);
     return 1;
 }
@@ -491,7 +545,8 @@ int LoadEnabledPlugins(const PluginLoadContext& ctx) {
                 continue;
             }
             std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            auto res = ds->luaExec(body);
+            std::string full = std::string("local arg = {}\n") + body;
+            auto res = ds->luaExec(full);
             if (!res) {
                 fprintf(stderr, "[plugin:%s] IOCTL_LUA_EXEC failed (%lu)\n",
                         m.name.c_str(), (unsigned long)::GetLastError());
@@ -499,7 +554,7 @@ int LoadEnabledPlugins(const PluginLoadContext& ctx) {
             }
             std::string actions;
             if (!res->output.empty()) ProcessPluginOutput(res->output, stderr, actions);
-            if (!actions.empty()) fwrite(actions.data(), 1, actions.size(), stderr);
+            if (!actions.empty()) WriteUtf8Wide(stderr, actions);
             if (res->luaStatus != 0) {
                 fprintf(stderr, "[plugin:%s] kernel-Lua returned status %d\n",
                         m.name.c_str(), res->luaStatus);

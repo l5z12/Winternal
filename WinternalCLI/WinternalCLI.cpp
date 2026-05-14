@@ -143,7 +143,9 @@ void PrintHelp() {
     app.subcommand(under(L"plugin-list",    L"plugin list",              L"enumerate manifested plugins", H_PLUG));
     app.subcommand(under(L"plugin-info",    L"plugin info <name>",       L"dump a plugin's manifest", H_PLUG));
     app.subcommand(under(L"plugin-enable",  L"plugin enable | disable <name>", L"persist enable state", H_PLUG));
-    app.subcommand(under(L"plugin-run",     L"plugin run <name>",        L"execute one-shot", H_PLUG));
+    app.subcommand(under(L"plugin-run",     L"plugin run <name> [args...]",
+                                            L"execute one-shot; trailing args land in the plugin's `arg` table",
+                                            H_PLUG));
 
     // Driver management.
     app.subcommand(under(L"drv-list",   L"drv list",                     L"list kernel-mode services", H_DMGT));
