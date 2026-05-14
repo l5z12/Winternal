@@ -6,7 +6,9 @@ return {
     entry       = "main.lua",
     depends     = {},
     commands    = {
-        { name = "pg-disable", description = "Apply the PG-disable patch (auto when KiFilterFiberContext is unpatched)" },
-        { name = "pg-revert",  description = "Restore the original 4-byte prologue from C:\\ProgramData\\Winternal\\pg_state.lua and delete it (auto when patched)" },
+        { name = "pg-disable", description = "Apply the PG-disable patch (errors if already patched)" },
+        { name = "pg-revert",  description = "Restore the original 4-byte prologue and delete the state file" },
+        { name = "status",     description = "Print the current prologue bytes and patch state" },
+        { name = "(no arg)",   description = "Self-toggle: patch if original, revert if patched" },
     },
 }
