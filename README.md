@@ -226,8 +226,8 @@ kdrv_register, kdrv_deregister, kdrv_load, kdrv_unload, kdrv_set_start.
 exposed so plugins can run entire ARK workflows inside the driver without
 an IOCTL round-trip per primitive. Grouped:
 
-- **basics** — `print`, `ksym`, `modksym`, `kread`, `kreadstr`,
-  `kwrite`, `kalloc`, `kfree`, `pids`
+- **basics** — `print`, `ksym`, `modksym`, `module`, `scan`, `kread`,
+  `kreadstr`, `kwrite`, `kalloc`, `kfree`, `pids`
 - **call + EPROCESS field tools** — `kcall`, `unprotect`, `kill`,
   `protect_lock`, `protect_unlock`, `protect_list`, `set_siglevel`,
   `token_uiaccess`, `kcode_patch`, `get_true_stub`, `get_w32proc`
@@ -263,6 +263,8 @@ The same primitives the compiled C code uses:
 | ------------------------------- | -------------------------------------------------- |
 | Resolve a known nt/hal export   | `wnk.ksym("RtlGetVersion")`                        |
 | Resolve any other kmod export   | `wnk.modksym("tcpip.sys", "TcpEnumerateAllConnections")` |
+| Find an *unexported* routine    | `wnk.scan(info.base, info.size, "48 89 5C 24 ? 57")` |
+| Get module base + size          | `info = wnk.module("ntoskrnl.exe")`                |
 | Build a native struct           | `string.pack("<I4 I4 z", size, flags, name)`       |
 | Pin it in kernel memory         | `buf = wnk.kalloc(size, false); wnk.kwrite(buf, blob)` |
 | Call with up to 12 args         | `rv, faulted = wnk.kcall(addr, buf, ...)`          |

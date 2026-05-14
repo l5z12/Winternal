@@ -2322,6 +2322,99 @@ static int KluaModKsym(lua_State* L) {
     return 1;
 }
 
+// ---- wnk.module(name) -> { base, size } or nil ----
+//
+// Returns the load base + image size of any kernel module by basename
+// (case-insensitive). Useful for bounding a signature scan to a single
+// module's address range.
+static int KluaModule(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    PRTL_PROCESS_MODULES mods = QueryAllModules();
+    if (!mods) { lua_pushnil(L); return 1; }
+    PVOID base = NULL;
+    UINT32 size = 0;
+    for (ULONG i = 0; i < mods->NumberOfModules; ++i) {
+        const char* bn = Klua_Basename((const char*)mods->Modules[i].FullPathName);
+        if (Klua_StrICmpA(bn, name) == 0) {
+            base = mods->Modules[i].ImageBase;
+            size = mods->Modules[i].ImageSize;
+            break;
+        }
+    }
+    ExFreePoolWithTag(mods, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!base) { lua_pushnil(L); return 1; }
+    lua_createtable(L, 0, 2);
+    lua_pushinteger(L, (lua_Integer)(ULONG_PTR)base); lua_setfield(L, -2, "base");
+    lua_pushinteger(L, size);                          lua_setfield(L, -2, "size");
+    return 1;
+}
+
+// ---- wnk.scan(addr, length, pattern) -> address or nil ----
+//
+// Byte-pattern scan for finding unexported routines, globals, references
+// — the standard kernel-research move when `ksym` / `modksym` come up
+// empty. `pattern` is an IDA-style string: `"48 89 5C 24 ? ? 57"` —
+// hex pairs separated by whitespace, `?` (or `??`) for wildcards. Max
+// pattern length 256 bytes. SEH-wrapped: a partial/torn page mid-scan
+// returns nil rather than bug-checking.
+static int Klua_NybbleHex(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int KluaScan(lua_State* L) {
+    PVOID base   = (PVOID)(ULONG_PTR)luaL_checkinteger(L, 1);
+    size_t len   = (size_t)luaL_checkinteger(L, 2);
+    const char* pat = luaL_checkstring(L, 3);
+    if ((ULONG_PTR)base < 0xFFFF800000000000ULL)
+        return luaL_error(L, "wnk.scan: user pointer");
+    if (len == 0 || len > 0x4000000)   // 64 MiB cap
+        return luaL_error(L, "wnk.scan: bad length");
+
+    UCHAR bytes[256] = {0};
+    UCHAR mask [256] = {0};
+    int np = 0;
+    const char* p = pat;
+    while (*p && np < 256) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (!*p) break;
+        if (*p == '?') {
+            bytes[np] = 0; mask[np] = 0;
+            ++p; if (*p == '?') ++p;
+        } else {
+            int hi = Klua_NybbleHex(*p++);
+            int lo = (*p && *p != ' ' && *p != '\t') ? Klua_NybbleHex(*p++) : hi;
+            if (hi < 0 || lo < 0) return luaL_error(L, "wnk.scan: bad hex at byte %d", np);
+            // If only one nibble was present (single hex digit), treat lo
+            // as the actual digit and hi as 0.
+            if (lo == hi && (*p == 0 || *p == ' ')) { bytes[np] = (UCHAR)hi; }
+            else                                    { bytes[np] = (UCHAR)((hi << 4) | lo); }
+            mask[np] = 0xFF;
+        }
+        ++np;
+    }
+    if (np == 0) return luaL_error(L, "wnk.scan: empty pattern");
+
+    PVOID found = NULL;
+    __try {
+        const UCHAR* b = (const UCHAR*)base;
+        for (size_t i = 0; i + (size_t)np <= len; ++i) {
+            int j = 0;
+            for (; j < np; ++j) {
+                if (mask[j] == 0) continue;
+                if (b[i + j] != bytes[j]) break;
+            }
+            if (j == np) { found = (PVOID)(b + i); break; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { found = NULL; }
+
+    if (!found) { lua_pushnil(L); return 1; }
+    lua_pushinteger(L, (lua_Integer)(ULONG_PTR)found);
+    return 1;
+}
+
 // ---- wnk.kreadstr(addr [, maxLen=4096]) -> string ----
 //
 // Read a NUL-terminated ASCII string from kernel memory, capped at
@@ -2793,6 +2886,8 @@ void KluaRegisterWnk(lua_State* L) {
         {"print",            KluaPrint},
         {"ksym",             KluaKsym},
         {"modksym",          KluaModKsym},
+        {"module",           KluaModule},
+        {"scan",             KluaScan},
         {"kread",            KluaKread},
         {"kreadstr",         KluaKreadStr},
         {"kwrite",           KluaKwrite},
