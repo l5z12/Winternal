@@ -17,6 +17,9 @@
 //   depends        { string, ... }          — other plugin names that must load first
 //   commands       { { name=, description= }, ... }
 //                                            — subcommands the plugin registers
+//   autorun        bool                      — fire entry at `winternal lua`
+//                                              startup. Defaults: true for
+//                                              lua-user/dll, false for lua-kernel.
 //
 // Persistent enable/disable state lives in:
 //   %APPDATA%/Winternal/plugins.lua          — returns a table { [name] = { enabled = bool } }
@@ -54,6 +57,11 @@ struct Manifest {
     std::filesystem::path    directory;     // absolute
     std::filesystem::path    manifestPath;  // absolute
     bool                     enabled;       // from persistent state
+    // Whether LoadEnabledPlugins fires the entry at `winternal lua`
+    // startup. Defaults: true for lua-user / dll (they register), false
+    // for lua-kernel (they act — set explicitly in plugin.lua if you
+    // want fire-on-start).
+    bool                     autorun;
 };
 
 class Registry {

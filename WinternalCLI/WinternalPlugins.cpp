@@ -49,6 +49,16 @@ std::string GetField(lua_State* L, const char* name, std::string def = {}) {
     return r;
 }
 
+// Reads an optional boolean manifest field. Returns def if the field is
+// missing or nil; honors explicit true/false otherwise.
+bool GetBoolField(lua_State* L, const char* name, bool def) {
+    lua_getfield(L, -1, name);
+    bool r = def;
+    if (!lua_isnil(L, -1)) r = (lua_toboolean(L, -1) != 0);
+    lua_pop(L, 1);
+    return r;
+}
+
 std::vector<std::string> GetStringArray(lua_State* L, const char* name) {
     std::vector<std::string> out;
     lua_getfield(L, -1, name);
@@ -154,6 +164,11 @@ bool Registry::parseManifest_(const fs::path& path, Manifest& out) {
     out.depends      = GetStringArray(L, "depends");
     out.commands     = GetCommandArray(L);
     out.enabled      = true;  // default; overridden by enableState
+    // autorun default depends on plugin type: lua-user / dll register at
+    // load time so default = true; lua-kernel acts on the system so
+    // default = false. Manifest can override either way.
+    bool autorunDefault = (t && *t != PluginType::LuaKernel);
+    out.autorun      = GetBoolField(L, "autorun", autorunDefault);
 
     lua_settop(L, 0);
 
@@ -366,6 +381,7 @@ int CmdPluginInfo(Registry& r, const wchar_t* name) {
     wprintf(L"directory:   %s\n", m->directory.wstring().c_str());
     wprintf(L"entry:       %S\n", m->entry.c_str());
     wprintf(L"state:       %s\n", m->enabled ? L"enabled" : L"disabled");
+    wprintf(L"autorun:     %s\n", m->autorun ? L"yes" : L"no");
     if (!m->depends.empty()) {
         wprintf(L"depends:\n");
         for (auto& d : m->depends) wprintf(L"  - %S\n", d.c_str());
@@ -441,15 +457,18 @@ int RunPluginCommand(int argc, wchar_t** argv) {
     return 1;
 }
 
-// Called at `winternal lua` startup. Walks the registry, loads each enabled
-// plugin per its type. Kernel-lua plugins go via the driver session; user-lua
-// plugins dofile into the host lua_State; dll plugins LoadLibrary + Init.
+// Called at `winternal lua` startup. Walks the registry, fires the entry
+// of each enabled plugin whose manifest opts in to autorun. Defaults:
+// lua-user / dll = true (they register functionality into wn.*); lua-
+// kernel = false (they perform actions, opt-in only). Manifests can flip
+// either default with `autorun = true|false`.
 int LoadEnabledPlugins(const PluginLoadContext& ctx) {
     Registry r;
     r.discover();
     int loaded = 0;
     for (auto& m : r.plugins()) {
         if (!m.enabled) continue;
+        if (!m.autorun) continue;
         fs::path entryPath = m.directory / m.entry;
 
         if (m.type == PluginType::LuaUser) {
@@ -474,14 +493,16 @@ int LoadEnabledPlugins(const PluginLoadContext& ctx) {
             std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             auto res = ds->luaExec(body);
             if (!res) {
-                fprintf(stderr, "[plugin:%s] IOCTL_LUA_EXEC failed (%lu)\n", m.name.c_str(), (unsigned long)::GetLastError());
+                fprintf(stderr, "[plugin:%s] IOCTL_LUA_EXEC failed (%lu)\n",
+                        m.name.c_str(), (unsigned long)::GetLastError());
                 continue;
             }
             std::string actions;
             if (!res->output.empty()) ProcessPluginOutput(res->output, stderr, actions);
             if (!actions.empty()) fwrite(actions.data(), 1, actions.size(), stderr);
             if (res->luaStatus != 0) {
-                fprintf(stderr, "[plugin:%s] kernel-Lua returned status %d\n", m.name.c_str(), res->luaStatus);
+                fprintf(stderr, "[plugin:%s] kernel-Lua returned status %d\n",
+                        m.name.c_str(), res->luaStatus);
                 continue;
             }
             ++loaded;

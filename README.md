@@ -348,14 +348,26 @@ return {
     type        = "lua-kernel",        -- or "lua-user", "dll"
     entry       = "main.lua",
     depends     = {},
+    autorun     = true,                -- optional; see below
     commands    = { { name = "demo-banner", description = "..." } },
 }
 ```
 
 Per-plugin enable/disable state is persisted in
-`%APPDATA%\Winternal\plugins.lua`. The CLI loads every enabled plugin at
-`winternal lua` startup; `winternal plugin run <name>` invokes one
-explicitly. Native DLL plugins must export `WinternalPluginInit` (ABI in
+`%APPDATA%\Winternal\plugins.lua`. `winternal plugin run <name>` always
+invokes a plugin explicitly. **Autorun behavior** for `winternal lua`
+startup is opt-in per plugin via the `autorun` manifest field:
+
+- `lua-user` and `dll` — default `autorun = true`. These plugins
+  typically register helpers into `wn.*`, so loading them at every Lua
+  startup is the expected shape.
+- `lua-kernel` — default `autorun = false`. These plugins act on the
+  system (kernel R/W, patches, hooks) and would do destructive things
+  on every `winternal lua` invocation. Set `autorun = true` in the
+  manifest if you really want fire-on-start.
+
+`plugin info <name>` shows the resolved `autorun:` value alongside
+state. Native DLL plugins must export `WinternalPluginInit` (ABI in
 `WinternalCLI/PluginAPI.h`); they get a `WinternalHost*` with a Lua state,
 the driver session, and `register_function` / `log` callbacks.
 
