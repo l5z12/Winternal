@@ -133,29 +133,67 @@ underline section headers, dynamic terminal-width detection). Top-level
 `winternal --help` lists every command grouped by section.
 
 ```text
-User-mode (no driver needed):
-  ps [--hidden] [<pid>]    dlls <pid>     drivers     svc [<name>]    net
-  handles [--pid N]        obj <path>     hooks <pid> [--inline]
-  kill | suspend | resume <pid>           close <pid> <handle>
-  tree                                    ASCII process tree
-  win <list|info|close|kill|hide|show|front|topmost|move|zbid> [args]
-                                          HWND utilities; `zbid` uses multi-stage escalation
+User-mode enumeration (no driver needed):
+  ps [--hidden] [<pid>]      drivers      svc [<name>]      net
+  obj <path>                 handles list [--pid N]
+  handles close <pid> <hv>   close a specific handle inside another process
+                             (DuplicateHandle + DUPLICATE_CLOSE_SOURCE)
 
-Kernel driver (admin + loaded Winternal.sys):
+Processes -- inspection, lifecycle, monitoring, protection (all under `proc`):
+  proc tree                                       ASCII process tree (DKOM-resistant
+                                                  when Winternal.sys is loaded)
+  proc dlls    <pid>                              PEB LDR walk (DLLs loaded in target)
+  proc threads <pid>                              kernel-side ZwQSI thread walk
+  proc mem     <pid> [--commit] [--exec]          KeStackAttach + ZwQueryVirtualMemory
+  proc hooks   <pid> [--inline]                   IAT (and optionally inline) hook scan
+  proc token   <pid>                              integrity / elevation / UIAccess / privs
+  proc mitigations <pid>                          DEP / ASLR / CFG / shadow-stack / signing
+  proc ghost   [--kill <pid>] [--kill-all] [-y]   HIDDEN / ZOMBIE / IMG-GONE detection
+  proc kill    <pid> [--exit N]                   TerminateProcess + handle-dup-close
+                                                  + per-thread fallbacks
+  proc kkill   <pid|name> [--glob] [--all] [-t]   driver-side PsTerminateProcess
+                                                  [--dry-run] [--exit-code N]
+  proc suspend <pid>     proc resume <pid>        NtSuspendProcess / NtResumeProcess
+  proc lock    <pid> [--level N] [--force]        set ProcessProtection + Ob handle
+                                                  lockdown (was top-level `protect`)
+  proc lock    --list                             list locked PIDs
+  proc unlock  <pid> [val] [off]                  reverse of `proc lock`
+  proc monitor [--include PAT] [--exclude PAT]    live create/exit/terminate stream
+               [--cmd] [--nocolor]                via PsSetCreateProcessNotifyRoutineEx
+                                                  + undocumented NtTerminateProcess hook
+  proc rule add <pat> <allow|deny|log>            create-time block rules
+            [--status NTSTATUS]                   (custom NTSTATUS on DENY when the
+                                                  inline hook is live; otherwise the
+                                                  CreationStatus veto path is used)
+  proc rule list | remove <id> | clear
+  proc protect add <pat> [--status NTSTATUS]      block process TERMINATION by image
+                                                  pattern. Inline hook path returns
+                                                  the requested NTSTATUS verbatim;
+                                                  Ob-fallback path (HVCI default)
+                                                  yields STATUS_ACCESS_DENIED.
+  proc protect list | remove <id> | clear
+
+Kernel callbacks / SSDT (non-per-PID inspection):
+  callbacks [process|image|thread]                kernel notify routines
+  kdrivers    ssdt
+
+Windows (HWND operations -- all under `win`):
+  win list [--pid N] [--title PAT] [--class PAT] [--visible]
+  win info  <hwnd>                                full window info dump
+  win close <hwnd>                                WM_CLOSE (polite, runs target's exit code)
+  win kill  <hwnd>                                WM_CLOSE + driver kkill if it survives
+  win hide  <hwnd>    win show <hwnd>             ShowWindow(SW_HIDE|SW_SHOWNA)
+  win front <hwnd>                                foreground with attach-input bypass
+  win topmost <hwnd> [off]                        toggle WS_EX_TOPMOST
+  win zbid <hwnd> [band 0..18]                    read/set the internal Z-band
+  win privacy <hwnd> [none|monitor|hide]          display-affinity (anti-screen-cap)
+  win move <hwnd> <x> <y> [w h]                   reposition (and optionally resize)
+
+Kernel primitives (admin + loaded Winternal.sys):
   kver | kpids
-  kr <addr> <len>          kw <addr> <hex>            ksym <name>
+  kr <addr> <len>          kw <addr> <hex>             ksym <name>
   kalloc <size> [paged|nonpaged]                       kfree <addr>
   kcall <addr> [a1..a4]
-  unprotect <pid> [val] [off]                          (also clears Ob lock)
-  protect   <pid> [--level N] [--force]                set Protection (+ Ob lockdown if --force)
-  protect   --list                                     list force-protected PIDs
-  kkill <pid|name> [--glob] [--all] [--tree|-t] [--dry-run] [--exit-code N]
-  ghost [--kill <pid>] [--kill-all] [--yes|-y]         find/kill HIDDEN/ZOMBIE/IMG-GONE processes
-  threads <pid>                                        kernel-side ZwQuerySystemInformation walk
-  mem     <pid> [--commit] [--exec]                    KeStackAttach + ZwQueryVirtualMemory
-  token   <pid>                                        UIAccess, integrity, elevation, privileges
-  mitigations <pid>                                    DEP / ASLR / CFG / shadow-stack / signing
-  callbacks [process|image|thread]                     kdrivers     ssdt
 
 Scripting:
   lua [script.lua | -e expr]    run user-mode Lua with the wn table
@@ -163,7 +201,8 @@ Scripting:
 
 Service management (admin):
   install [--path SYS] [--no-start]    uninstall    status    selftest
-  selfprotect [on|off|status]                  block external tampering
+  selfprotect [on|off|status]          block external tampering
+  recover                              re-grant DACL after a botched selfprotect
 
 Driver management (admin):
   drv list | start | stop | enable | disable | delete <name>
@@ -178,13 +217,54 @@ NTFS monitoring + analyzing:
   ntfs streams <path>                   alternate data streams (ADS)
   ntfs compare <path>                   FindFirstFile vs MFT diff (hide detect)
   ntfs raw <device> <off> <len>         driver-backed raw read (bypasses minifilters)
-  ntfs filter add <pat> <action>        block/redirect file opens (kernel NtCreateFile hook)
-  ntfs filter list | remove <id> | clear (bypasses SCM)
+  ntfs filter add <pat> <action>        block/redirect file opens (kernel minifilter)
+  ntfs filter list | remove <id> | clear
 
 Plugins:
   plugin list                        plugin info <name>
   plugin enable|disable <name>       plugin run <name>
 ```
+
+### `proc kill` fallback chain
+
+`proc kill <pid>` tries each user-mode termination technique in order and reports
+which one stuck:
+
+1. `TerminateProcess(handle, code)` — needs `PROCESS_TERMINATE`.
+2. **Handle-dup-close** — enumerate every handle the target owns via
+   `NtQuerySystemInformation(SystemExtendedHandleInformation)`, then yank each
+   one with `DuplicateHandle(target, h, self, &out, 0, 0, DUPLICATE_CLOSE_SOURCE)`.
+   Needs `PROCESS_DUP_HANDLE` on the target. This is the indirect-kill path
+   Win11 Task Manager's End Task falls back to when direct termination fails.
+3. **Per-thread terminate** — enumerate threads via `SystemProcessInformation`,
+   `OpenThread(THREAD_TERMINATE)` + `TerminateThread` each. Once every thread
+   is gone the process tears down.
+
+Each step waits up to 250–500 ms with `WaitForSingleObject` before declaring
+success, so a `DuplicateHandle` that closed a non-load-bearing handle doesn't
+get reported as a kill. No `WM_CLOSE` / window path — that's `win close <hwnd>`.
+
+### `proc protect` and HVCI
+
+`proc protect` has two enforcement paths and the CLI tells you which is live
+after `add`:
+
+- **Inline hook** (CR0.WP-toggle write to `NtTerminateProcess` prologue). Can
+  return any per-rule NTSTATUS to the terminator. HVCI / Memory Integrity
+  typically rejects the CR0 toggle and the hook fails to install.
+- **Ob fallback** (`ObRegisterCallbacks` on `PsProcessType` / `PsThreadType`).
+  Strips `PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE` and
+  the sentinel bits (`MAXIMUM_ALLOWED`, `GENERIC_*`) from new handles. Always
+  yields `STATUS_ACCESS_DENIED` regardless of `--status`. HVCI-safe.
+
+Neither path blocks **self-termination**. Win11 Task Manager's End Task starts
+with `SendMessageTimeoutW(hwnd, WM_SYSCOMMAND, SC_CLOSE, ...)`; a target that
+honors `WM_CLOSE` calls `ExitProcess` on itself, which is
+`NtTerminateProcess(NtCurrentProcess(), 0)` with the implicit `-1` self-handle.
+That handle never goes through `OpenProcess`, so no Ob pre-op fires. The only
+thing that could block self-termination is the inline hook, which HVCI is
+blocking. If you need that on HVCI, disable Memory Integrity (Windows Security
+→ Device Security → Core Isolation), reboot, and re-add the rule.
 
 Global behavior: `--debug` is accepted on most subcommands and prints
 intermediate IOCTL traffic; Ctrl+C cancels in-flight `DeviceIoControl`
@@ -513,7 +593,7 @@ after `selfprotect on` returns — so a PID-based filter would only
 briefly cover the CLI itself and then leak a stale (potentially-reused)
 PID into the protect list. If you want OpenProcess filtering on an
 interactive session (e.g. `winternal lua` REPL), run
-`winternal protect <pid> --force` from inside it; the Ob surface is
+`winternal proc lock <pid> --force` from inside it; the Ob surface is
 intentionally a separate, manually-invoked tool from `selfprotect`.
 
 Identity check uses a **SHA-256 of the caller's main image** computed

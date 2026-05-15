@@ -2870,7 +2870,7 @@ static NTSTATUS HandleSelfProtectSet(PVOID InBuf, size_t InLen)
         // identity that matters across CLI invocations is the binary
         // hash, not the PID. If you want short-lived OpenProcess
         // protection on an interactive session, run
-        // `winternal protect <pid> --force` explicitly.
+        // `winternal proc lock <pid> --force` explicitly.
         UCHAR hash[WN_SELFPROT_HASH_LEN];
         NTSTATUS hs = WinternalHashCallerImage(hash);
         if (!NT_SUCCESS(hs)) {
@@ -2920,7 +2920,7 @@ static NTSTATUS HandleSelfProtectSet(PVOID InBuf, size_t InLen)
         // a JMP to freed pool memory in ntoskrnl is a guaranteed BSOD.
         WinternalUninstallNtUnloadHook();
         // No Ob-list manipulation: engage didn't add to it, disengage
-        // doesn't remove from it. `winternal protect/unprotect` still
+        // doesn't remove from it. `winternal proc lock/unlock` still
         // works for explicit per-PID Ob protection on interactive sessions.
         return STATUS_SUCCESS;
     }

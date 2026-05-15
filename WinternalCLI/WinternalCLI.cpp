@@ -15,15 +15,18 @@
 //   handles [--pid N]     list handles (optionally filtered)
 //   obj <path>            list NT object directory entries
 //   hooks <pid>           IAT hook scan for a process
-//   hooks <pid> --inline  also do inline byte compare (slow)
-//   kill <pid>            terminate a process
-//   suspend <pid>         suspend a process
-//   resume <pid>          resume a process
-//   close <pid> <h>       force-close a handle in another process
-//   kpids                 ask the Winternal kernel driver for its PID list and
-//                         compare with the user-mode list (DKOM detection)
-//   kver                  show Winternal driver version
-//   help                  show this help
+//   proc hooks <pid> [--inline] IAT (and optional inline) hook scan
+//   handles close <pid> <h>     force-close a handle in another process
+//   proc kill <pid>             terminate a process (with fallback chain)
+//   proc suspend|resume <pid>   NtSuspendProcess / NtResumeProcess
+//   proc tree                   ASCII process tree
+//   proc dlls <pid>             PEB LDR walk
+//   proc token <pid>            integrity / privs / SID
+//   proc mitigations <pid>      DEP / ASLR / CFG / shadow-stack
+//   kpids                     ask the Winternal kernel driver for its PID list
+//                             and compare with the user-mode list (DKOM detect)
+//   kver                      show Winternal driver version
+//   help                      show this help
 //
 // Most read-only commands work without elevation. Process/handle inspection
 // against system services and reading PEBs requires Administrator + the
@@ -91,7 +94,10 @@ void PrintHelp() {
                     const wchar_t* heading) {
         return wclap::App(name).display(display).about(about).help_heading(heading);
     };
-    const wchar_t* H_DRV  = L"Kernel driver (requires admin + loaded Winternal.sys)";
+    const wchar_t* H_PROC = L"Processes (`proc <sub>`)";
+    const wchar_t* H_WIN  = L"Windows / HWND (`win <sub>`)";
+    const wchar_t* H_KMEM = L"Kernel primitives (admin + loaded Winternal.sys)";
+    const wchar_t* H_KINS = L"Kernel inspection (admin + driver)";
     const wchar_t* H_NTFS = L"NTFS monitoring + analyzing";
     const wchar_t* H_SVC  = L"Service management (admin)";
     const wchar_t* H_PLUG = L"Plugins";
@@ -100,51 +106,68 @@ void PrintHelp() {
     wclap::App app(L"winternal");
     app.about(L"winternal - Windows kernel-aware ARK toolkit");
 
-    // Default group: core process / inspection.
-    app.subcommand(cmd(L"ps",      L"ps [--hidden] [<pid>]",                 L"list processes (or detail one)"));
-    app.subcommand(cmd(L"dlls",    L"dlls <pid>",                            L"list loaded modules in a process"));
-    app.subcommand(cmd(L"drivers", L"drivers",                               L"list loaded kernel modules"));
-    app.subcommand(cmd(L"svc",     L"svc [<name>]",                          L"list services"));
-    app.subcommand(cmd(L"net",     L"net",                                   L"list TCP/UDP endpoints"));
-    app.subcommand(cmd(L"handles", L"handles [--pid N]",                     L"list open handles"));
-    app.subcommand(cmd(L"obj",     L"obj <path>",                            L"list NT object directory entries"));
-    app.subcommand(cmd(L"hooks",   L"hooks <pid> [--inline]",                L"scan IAT (and optionally inline) hooks"));
-    app.subcommand(cmd(L"kill",    L"kill <pid>",                            L"terminate a process"));
-    app.subcommand(cmd(L"suspend", L"suspend <pid> | resume <pid>",          L"suspend/resume a process"));
-    app.subcommand(cmd(L"close",   L"close <pid> <handle>",                  L"force-close a remote handle"));
+    // Default group: enumeration that doesn't target a single PID.
+    app.subcommand(cmd(L"ps",      L"ps [--hidden] [<pid>]",         L"list processes (or detail one)"));
+    app.subcommand(cmd(L"drivers", L"drivers",                       L"list loaded kernel modules"));
+    app.subcommand(cmd(L"svc",     L"svc [<name>]",                  L"list services"));
+    app.subcommand(cmd(L"net",     L"net",                           L"list TCP/UDP endpoints"));
+    app.subcommand(cmd(L"handles", L"handles list [--pid N] | handles close <pid> <hv>",
+                                   L"system-wide handle table; subcommand `close` yanks one via DuplicateHandle"));
+    app.subcommand(cmd(L"obj",     L"obj <path>",                    L"list NT object directory entries"));
 
-    // Kernel-driver group.
-    app.subcommand(under(L"kver",      L"kver",                          L"show driver version",                   H_DRV));
-    app.subcommand(under(L"kpids",     L"kpids",                         L"kernel-side PID enum (DKOM detection)", H_DRV));
-    app.subcommand(under(L"kr",        L"kr <addr> <len>",               L"read kernel memory (hexdump)",          H_DRV));
-    app.subcommand(under(L"kw",        L"kw <addr> <hex>",               L"write kernel memory",                   H_DRV));
-    app.subcommand(under(L"ksym",      L"ksym <name>",                   L"look up an ntoskrnl export address",    H_DRV));
-    app.subcommand(under(L"kalloc",    L"kalloc <size> [paged|nonpaged]",L"allocate pool, print address",          H_DRV));
-    app.subcommand(under(L"kfree",     L"kfree <addr>",                  L"free pool allocated by kalloc",         H_DRV));
-    app.subcommand(under(L"kcall",     L"kcall <addr> [a1..a4]",         L"call a kernel routine with up to 4 args", H_DRV));
-    app.subcommand(under(L"unprotect", L"unprotect <pid> [val] [off]",   L"clear EPROCESS->Protection (and Ob lock) on a PID", H_DRV));
-    app.subcommand(under(L"protect",   L"protect <pid> [--level N] [--force]",
-                                       L"set Protection (default 0x72); --force adds Ob lockdown", H_DRV));
-    app.subcommand(under(L"protect-list", L"protect --list",             L"list force-protected PIDs",             H_DRV));
-    app.subcommand(under(L"kkill",     L"kkill <pid|name> [--glob] [--all] [--tree|-t] [--dry-run] [--exit-code N]",
-                                       L"terminate via the driver (PPL/PP-safe); see `kkill` with no args", H_DRV));
-    app.subcommand(under(L"ghost",     L"ghost [--kill <pid>] [--kill-all] [--yes|-y]",
-                                       L"list/kill processes the system is hiding (DKOM / zombie / image-deleted)", H_DRV));
-    app.subcommand(under(L"tree",      L"tree",                          L"ASCII process tree (parent/child hierarchy)", H_DRV));
-    app.subcommand(under(L"threads",   L"threads <pid>",                 L"list a process's threads (TID, start addr, state, wait reason)", H_DRV));
+    // Process group: everything that operates on a process.
+    app.subcommand(under(L"proc-tree",    L"proc tree",                            L"ASCII process tree (DKOM-resistant via driver)",          H_PROC));
+    app.subcommand(under(L"proc-dlls",    L"proc dlls <pid>",                      L"loaded modules in a process (PEB LDR walk)",              H_PROC));
+    app.subcommand(under(L"proc-threads", L"proc threads <pid>",                   L"kernel-side ZwQSI thread walk (TID, start, state, wait)", H_PROC));
+    app.subcommand(under(L"proc-mem",     L"proc mem <pid> [--commit] [--exec]",   L"KeStackAttach + ZwQueryVirtualMemory region walk",        H_PROC));
+    app.subcommand(under(L"proc-hooks",   L"proc hooks <pid> [--inline]",          L"scan IAT (and optionally inline) hooks in a process",     H_PROC));
+    app.subcommand(under(L"proc-token",   L"proc token <pid>",                     L"integrity / elevation / UIAccess / privileges / SID",     H_PROC));
+    app.subcommand(under(L"proc-mitigations", L"proc mitigations <pid>",           L"DEP / ASLR / CFG / shadow-stack / signing policies",      H_PROC));
+    app.subcommand(under(L"proc-ghost",   L"proc ghost [--kill <pid>] [--kill-all] [-y]",
+                                          L"list/kill HIDDEN / ZOMBIE / IMG-GONE processes",                                                  H_PROC));
+    app.subcommand(under(L"proc-kill",    L"proc kill <pid> [--exit N]",
+                                          L"terminate -- tries TerminateProcess, handle-dup-close, per-thread fallbacks",                     H_PROC));
+    app.subcommand(under(L"proc-kkill",   L"proc kkill <pid|name> [--glob] [--all] [-t] [--dry-run] [--exit-code N]",
+                                          L"driver-side PsTerminateProcess (PPL-safe; last resort)",                                          H_PROC));
+    app.subcommand(under(L"proc-suspend", L"proc suspend <pid> | proc resume <pid>", L"NtSuspendProcess / NtResumeProcess",                   H_PROC));
+    app.subcommand(under(L"proc-lock",    L"proc lock <pid> [--level N] [--force]",
+                                          L"set EPROCESS->Protection (default 0x72); --force adds Ob handle-strip lockdown",                  H_PROC));
+    app.subcommand(under(L"proc-lock-list", L"proc lock --list",                   L"list PID-locked processes",                              H_PROC));
+    app.subcommand(under(L"proc-unlock",  L"proc unlock <pid> [val] [off]",        L"clear EPROCESS->Protection (and the Ob lock)",          H_PROC));
     app.subcommand(under(L"proc-monitor", L"proc monitor [--include W] [--exclude W] [--cmd]",
-                                       L"real-time process create/exit stream via PsSetCreateProcessNotifyRoutineEx", H_DRV));
-    app.subcommand(under(L"proc-rule",    L"proc rule <add|list|remove|clear> [args]",
-                                       L"block/log process creates by image-path wildcard (deny -> STATUS_ACCESS_DENIED)", H_DRV));
-    app.subcommand(under(L"mem",       L"mem <pid> [--commit] [--exec]", L"VirtualQuery walk: regions, prot, type, mapped module", H_DRV));
-    app.subcommand(under(L"token",     L"token <pid>",                   L"integrity level, elevation, UIAccess, privileges, user SID", H_DRV));
-    app.subcommand(under(L"mitigations", L"mitigations <pid>",           L"DEP / ASLR / CFG / shadow-stack / signing policies", H_DRV));
-    app.subcommand(under(L"win",       L"win <list|info|close|kill|hide|show|front|topmost|move> [args]",
-                                       L"HWND utilities; run `winternal win` for subcommand help", H_DRV));
-    app.subcommand(under(L"callbacks", L"callbacks [process|image|thread]", L"enumerate kernel notify-routine arrays", H_DRV));
-    app.subcommand(under(L"kdrivers",  L"kdrivers",                      L"enumerate loaded kernel modules via the driver", H_DRV));
-    app.subcommand(under(L"ssdt",      L"ssdt",                          L"enumerate KeServiceDescriptorTable entries", H_DRV));
-    app.subcommand(under(L"lua",       L"lua [script | -e expr]",        L"run a Lua script in the wn binding (REPL if no arg)", H_DRV));
+                                          L"real-time create/exit/terminate stream via PsSetCreateProcessNotifyRoutineEx + NtTerminate hook", H_PROC));
+    app.subcommand(under(L"proc-rule",    L"proc rule add <pat> <allow|deny|log> [--status NTSTATUS]",
+                                          L"create-time block/log rules; deny writes NTSTATUS into CreationStatus",                           H_PROC));
+    app.subcommand(under(L"proc-protect", L"proc protect add <pat> [--status NTSTATUS]",
+                                          L"prohibit termination by image-path pattern (inline-hook path + Ob fallback)",                     H_PROC));
+
+    // Window group.
+    app.subcommand(under(L"win-list",     L"win list [--pid N] [--title P] [--class P] [--visible]", L"enumerate top-level windows",      H_WIN));
+    app.subcommand(under(L"win-info",     L"win info <hwnd>",                       L"full window info dump",                                H_WIN));
+    app.subcommand(under(L"win-close",    L"win close <hwnd>",                      L"WM_CLOSE (polite -- target may save state)",          H_WIN));
+    app.subcommand(under(L"win-kill",     L"win kill <hwnd>",                       L"WM_CLOSE + driver kkill if it survives",              H_WIN));
+    app.subcommand(under(L"win-show",     L"win show <hwnd> | win hide <hwnd>",     L"ShowWindow(SW_SHOWNA / SW_HIDE)",                      H_WIN));
+    app.subcommand(under(L"win-front",    L"win front <hwnd>",                      L"foreground with attach-input bypass",                 H_WIN));
+    app.subcommand(under(L"win-topmost",  L"win topmost <hwnd> [off]",              L"toggle WS_EX_TOPMOST",                                 H_WIN));
+    app.subcommand(under(L"win-zbid",     L"win zbid <hwnd> [band 0..18]",          L"read/set the internal Z-band (above topmost)",        H_WIN));
+    app.subcommand(under(L"win-privacy",  L"win privacy <hwnd> [none|monitor|hide]",L"display affinity (anti-screen-cap)",                  H_WIN));
+    app.subcommand(under(L"win-move",     L"win move <hwnd> <x> <y> [w h]",         L"reposition (and optionally resize)",                  H_WIN));
+
+    // Kernel primitives (raw R/W, alloc, sym, call).
+    app.subcommand(under(L"kver",   L"kver",                            L"show driver version",                       H_KMEM));
+    app.subcommand(under(L"kpids",  L"kpids",                           L"kernel-side PID enum (DKOM detection)",     H_KMEM));
+    app.subcommand(under(L"kr",     L"kr <addr> <len>",                 L"read kernel memory (hexdump)",              H_KMEM));
+    app.subcommand(under(L"kw",     L"kw <addr> <hex>",                 L"write kernel memory",                       H_KMEM));
+    app.subcommand(under(L"ksym",   L"ksym <name>",                     L"look up an ntoskrnl export address",        H_KMEM));
+    app.subcommand(under(L"kalloc", L"kalloc <size> [paged|nonpaged]",  L"allocate pool, print address",              H_KMEM));
+    app.subcommand(under(L"kfree",  L"kfree <addr>",                    L"free pool allocated by kalloc",             H_KMEM));
+    app.subcommand(under(L"kcall",  L"kcall <addr> [a1..a4]",           L"call a kernel routine with up to 4 args",   H_KMEM));
+
+    // Kernel-side inspection (non-per-PID; per-PID inspection lives under `proc`).
+    app.subcommand(under(L"callbacks",   L"callbacks [process|image|thread]",L"enumerate kernel notify-routine arrays",                    H_KINS));
+    app.subcommand(under(L"kdrivers",    L"kdrivers",                        L"enumerate loaded kernel modules via the driver",            H_KINS));
+    app.subcommand(under(L"ssdt",        L"ssdt",                            L"enumerate KeServiceDescriptorTable entries",                H_KINS));
+    app.subcommand(under(L"lua",         L"lua [script | -e expr]",          L"run a Lua script in the wn binding (REPL if no arg)",       H_KINS));
 
     // NTFS group.
     app.subcommand(under(L"ntfs-vols",    L"ntfs vols",                          L"list NTFS volumes + metadata", H_NTFS));
@@ -301,16 +324,22 @@ void CmdPs(int argc, wchar_t** argv) {
 }
 
 void CmdDlls(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"dlls: missing PID\n"); return; }
-    uint32_t pid = ParseUint(argv[0]);
+    wclap::App app(L"winternal proc dlls");
+    app.about(L"List loaded modules (DLLs) in a process by walking its PEB "
+              L"LDR list. Modules whose on-disk file has been deleted are "
+              L"tagged MISS -- a common indicator of process-hollowing or "
+              L"reflective load.")
+       .arg(wclap::Arg(L"pid").positional().required().help(L"Target PID"));
+    auto m = app.parse(argc, argv);
+    uint32_t pid = (uint32_t)*m.value_u64(L"pid");
     auto mods = EnumProcessModules(pid);
     if (mods.empty()) { fwprintf(stderr, L"No modules (insufficient access? PID exited?)\n"); return; }
-    wprintf(L"%-18s %-10s %-6s %s\n", L"Base", L"Size(KB)", L"Disk", L"Path");
-    for (auto& m : mods) {
-        wprintf(L"0x%016llx %10u %-6s %s\n",
-                (unsigned long long)m.baseAddress, m.size / 1024,
-                m.fileMissing ? L"MISS" : L"ok",
-                m.path.empty() ? m.name.c_str() : m.path.c_str());
+    wprintf(L"%-18ls %-10ls %-6ls %ls\n", L"Base", L"Size(KB)", L"Disk", L"Path");
+    for (auto& mod : mods) {
+        wprintf(L"0x%016llx %10u %-6ls %ls\n",
+                (unsigned long long)mod.baseAddress, mod.size / 1024,
+                mod.fileMissing ? L"MISS" : L"ok",
+                mod.path.empty() ? mod.name.c_str() : mod.path.c_str());
     }
 }
 
@@ -383,7 +412,7 @@ void CmdNet() {
     }
 }
 
-void CmdHandles(int argc, wchar_t** argv) {
+static void CmdHandlesList(int argc, wchar_t** argv) {
     uint32_t pid = 0;
     for (int i = 0; i < argc; ++i) {
         if (wcscmp(argv[i], L"--pid") == 0 && i + 1 < argc) pid = ParseUint(argv[++i]);
@@ -399,6 +428,36 @@ void CmdHandles(int argc, wchar_t** argv) {
     }
 }
 
+static int CmdHandlesClose(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal handles close");
+    app.about(L"Close a specific handle inside another process via DuplicateHandle("
+              L"DUPLICATE_CLOSE_SOURCE). Useful for forcing release of file/mutex/"
+              L"event handles a third-party process is holding. Needs PROCESS_DUP_HANDLE "
+              L"on the target.")
+       .arg(wclap::Arg(L"pid").positional().required().help(L"Owning PID"))
+       .arg(wclap::Arg(L"handle").positional().required().help(L"Handle value (decimal or 0xHEX)"));
+    auto m = app.parse(argc, argv);
+    uint32_t pid = (uint32_t)*m.value_u64(L"pid");
+    uint32_t hv  = (uint32_t)*m.value_u64(L"handle");
+    if (CloseHandleInProcess(pid, hv)) {
+        wprintf(L"Closed handle 0x%x in pid %u\n", hv, pid);
+        return 0;
+    }
+    fwprintf(stderr, L"close failed: %S\n", FormatError(GetLastError()).c_str());
+    return 1;
+}
+
+void CmdHandles(int argc, wchar_t** argv) {
+    if (argc >= 1) {
+        std::wstring_view sub = argv[0];
+        if (sub == L"list")  { CmdHandlesList(argc - 1, argv + 1); return; }
+        if (sub == L"close") { (void)CmdHandlesClose(argc - 1, argv + 1); return; }
+        // Fall through: legacy invocation without an explicit subcommand
+        // (e.g. `winternal handles --pid 1234`) still works as `list`.
+    }
+    CmdHandlesList(argc, argv);
+}
+
 void CmdObj(int argc, wchar_t** argv) {
     std::wstring path = argc >= 1 ? argv[0] : L"\\";
     auto entries = ListObjectDir(path);
@@ -410,10 +469,19 @@ void CmdObj(int argc, wchar_t** argv) {
 }
 
 void CmdHooks(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"hooks: missing PID\n"); return; }
-    uint32_t pid = ParseUint(argv[0]);
-    bool inl = false;
-    for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--inline") == 0) inl = true;
+    wclap::App app(L"winternal proc hooks");
+    app.about(L"Scan a process for hooks. Default is an IAT walk -- iterate "
+              L"every loaded module's Import Address Table and flag entries "
+              L"that don't point at the canonical export of the named "
+              L"module. With --inline, also slow-scan every imported "
+              L"function's prologue against the on-disk image bytes (catches "
+              L"trampoline patches that IAT scans miss).")
+       .arg(wclap::Arg(L"pid").positional().required().help(L"Target PID"))
+       .arg(wclap::Arg(L"inline").long_name(L"inline")
+                .help(L"Also compare prologue bytes vs on-disk image (slow)"));
+    auto m = app.parse(argc, argv);
+    uint32_t pid = (uint32_t)*m.value_u64(L"pid");
+    bool inl = m.present(L"inline");
 
     auto iat = ScanIatHooks(pid);
     wprintf(L"-- IAT hooks: %zu --\n", iat.size());
@@ -448,7 +516,7 @@ int CmdKill(int argc, wchar_t** argv) {
               L"  3. OpenThread(THREAD_TERMINATE) + TerminateThread on every thread\n"
               L"\n"
               L"No WM_CLOSE / window-close path -- this is a process kill, not a polite\n"
-              L"close request. Use `close <pid>` for that.")
+              L"close request. Use `win close <hwnd>` for that.")
        .arg(wclap::Arg(L"pid").positional().required().help(L"Target PID (decimal)"))
        .arg(wclap::Arg(L"exit").long_name(L"exit").takes_value().default_value(L"1")
                 .help(L"Exit code passed to TerminateProcess"));
@@ -471,11 +539,21 @@ int CmdKill(int argc, wchar_t** argv) {
 }
 
 int CmdSuspend(int argc, wchar_t** argv, bool resume) {
-    if (argc < 1) { fwprintf(stderr, L"%s: missing PID\n", resume ? L"resume" : L"suspend"); return 1; }
-    uint32_t pid = ParseUint(argv[0]);
+    wclap::App app(resume ? L"winternal proc resume" : L"winternal proc suspend");
+    app.about(resume
+        ? L"Resume all threads of a suspended process (NtResumeProcess). "
+          L"Needs PROCESS_SUSPEND_RESUME."
+        : L"Suspend every thread in a process (NtSuspendProcess). The process "
+          L"keeps existing but stops making forward progress. Needs PROCESS_"
+          L"SUSPEND_RESUME on the target.")
+       .arg(wclap::Arg(L"pid").positional().required().help(L"Target PID"));
+    auto m = app.parse(argc, argv);
+    uint32_t pid = (uint32_t)*m.value_u64(L"pid");
     bool ok = resume ? ResumeProcessById(pid) : SuspendProcessById(pid);
-    if (ok) { wprintf(L"%s %u\n", resume ? L"Resumed" : L"Suspended", pid); return 0; }
-    fwprintf(stderr, L"Failed (%u): %S\n", GetLastError(), FormatError(GetLastError()).c_str());
+    if (ok) { wprintf(L"%ls %u\n", resume ? L"Resumed" : L"Suspended", pid); return 0; }
+    fwprintf(stderr, L"%ls failed (%u): %S\n",
+             resume ? L"resume" : L"suspend",
+             GetLastError(), FormatError(GetLastError()).c_str());
     return 1;
 }
 
@@ -568,43 +646,71 @@ std::vector<uint8_t> ParseHexBytes(std::wstring_view s) {
 }
 
 int CmdKread(int argc, wchar_t** argv) {
-    if (argc < 2) { fwprintf(stderr, L"kr: kr <addr> <len>\n"); return 1; }
-    uint64_t addr = ParseU64(argv[0]);
-    uint32_t len = (uint32_t)ParseU64(argv[1]);
+    wclap::App app(L"winternal kr");
+    app.about(L"Read kernel virtual memory via the driver and hexdump it. "
+              L"Address must be in the kernel half (sign-extended high). "
+              L"Length is capped at the driver's per-IOCTL output buffer "
+              L"(~64 KiB); larger reads should be chunked.")
+       .arg(wclap::Arg(L"addr").positional().required().help(L"Kernel address (0xHEX or decimal)"))
+       .arg(wclap::Arg(L"len").positional().required().help(L"Byte count to read"));
+    auto m = app.parse(argc, argv);
+    uint64_t addr = *m.value_u64(L"addr");
+    uint32_t len  = (uint32_t)*m.value_u64(L"len");
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     auto data = s.kread(addr, len);
-    if (!data) { fwprintf(stderr, L"kread failed: %lu\n", ::GetLastError()); return 1; }
+    if (!data) { fwprintf(stderr, L"kr failed: %lu\n", ::GetLastError()); return 1; }
     HexDump(addr, data->data(), data->size());
     return 0;
 }
 
 int CmdKwrite(int argc, wchar_t** argv) {
-    if (argc < 2) { fwprintf(stderr, L"kw: kw <addr> <hex-bytes>\n"); return 1; }
-    uint64_t addr = ParseU64(argv[0]);
-    auto bytes = ParseHexBytes(argv[1]);
+    wclap::App app(L"winternal kw");
+    app.about(L"Write bytes into kernel memory. The driver bypasses CR0.WP "
+              L"for code-page writes; this is the gun that makes the rest of "
+              L"the toolkit work. Caller is responsible for not breaking the "
+              L"kernel.")
+       .arg(wclap::Arg(L"addr").positional().required().help(L"Kernel address"))
+       .arg(wclap::Arg(L"hex").positional().required().help(L"Hex bytes (e.g. \"4889E5C3\")"));
+    auto m = app.parse(argc, argv);
+    uint64_t addr = *m.value_u64(L"addr");
+    auto bytes = ParseHexBytes(m.value(L"hex")->c_str());
     if (bytes.empty()) { fwprintf(stderr, L"kw: invalid hex string\n"); return 1; }
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     if (!s.kwrite(addr, bytes.data(), (uint32_t)bytes.size())) {
-        fwprintf(stderr, L"kwrite failed: %lu\n", ::GetLastError()); return 1;
+        fwprintf(stderr, L"kw failed: %lu\n", ::GetLastError()); return 1;
     }
     wprintf(L"Wrote %zu bytes at 0x%016llx\n", bytes.size(), (unsigned long long)addr);
     return 0;
 }
 
 int CmdKsym(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"ksym: ksym <name>\n"); return 1; }
+    wclap::App app(L"winternal ksym");
+    app.about(L"Resolve an ntoskrnl / hal export via MmGetSystemRoutineAddress "
+              L"and print its kernel VA. Forwarded exports return nil; for "
+              L"non-ntos modules use `wnk.modksym(mod, name)` from a Lua "
+              L"plugin instead.")
+       .arg(wclap::Arg(L"name").positional().required().help(L"Export name (e.g. \"PsActiveProcessHead\")"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
-    auto a = s.ksym(argv[0]);
-    if (!a) { fwprintf(stderr, L"ksym %s: not found\n", argv[0]); return 1; }
-    wprintf(L"%s = 0x%016llx\n", argv[0], (unsigned long long)*a);
+    auto a = s.ksym(name);
+    if (!a) { fwprintf(stderr, L"ksym %ls: not found\n", name); return 1; }
+    wprintf(L"%ls = 0x%016llx\n", name, (unsigned long long)*a);
     return 0;
 }
 
 int CmdKalloc(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"kalloc: kalloc <size> [paged|nonpaged]\n"); return 1; }
-    uint32_t sz = (uint32_t)ParseU64(argv[0]);
+    wclap::App app(L"winternal kalloc");
+    app.about(L"Allocate kernel pool via the driver and print the address. "
+              L"Use `kfree` to release. Default pool type is non-paged (ok at "
+              L"DISPATCH_LEVEL and below); pass `paged` if you need the page "
+              L"file to back it.")
+       .arg(wclap::Arg(L"size").positional().required().help(L"Allocation size in bytes"))
+       .arg(wclap::Arg(L"type").positional().help(L"`paged` or `nonpaged` (default: nonpaged)"));
+    auto m = app.parse(argc, argv);
+    uint32_t sz = (uint32_t)*m.value_u64(L"size");
     bool np = true;
-    if (argc >= 2 && wcscmp(argv[1], L"paged") == 0) np = false;
+    if (auto t = m.value(L"type"); t && *t == L"paged") np = false;
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     auto a = s.kalloc(sz, 0, np);
     if (!a) { fwprintf(stderr, L"kalloc failed: %lu\n", ::GetLastError()); return 1; }
@@ -613,37 +719,66 @@ int CmdKalloc(int argc, wchar_t** argv) {
 }
 
 int CmdKfree(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"kfree: kfree <addr>\n"); return 1; }
-    uint64_t a = ParseU64(argv[0]);
+    wclap::App app(L"winternal kfree");
+    app.about(L"Free a kernel-pool allocation previously returned by `kalloc`. "
+              L"Don't call this on arbitrary kernel addresses -- the driver "
+              L"hands the pointer to ExFreePoolWithTag, which BSOD's on a bad "
+              L"pool header.")
+       .arg(wclap::Arg(L"addr").positional().required().help(L"Pool address (must be from kalloc)"));
+    auto m = app.parse(argc, argv);
+    uint64_t a = *m.value_u64(L"addr");
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     if (!s.kfree(a)) { fwprintf(stderr, L"kfree failed: %lu\n", ::GetLastError()); return 1; }
     return 0;
 }
 
 int CmdKcall(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"kcall: kcall <addr> [a1] [a2] [a3] [a4]\n"); return 1; }
-    uint64_t addr = ParseU64(argv[0]);
+    wclap::App app(L"winternal kcall");
+    app.about(L"Call a kernel routine through the driver with up to four "
+              L"64-bit arguments (Windows x64 calling convention: RCX, RDX, "
+              L"R8, R9). The driver runs at PASSIVE_LEVEL on a system worker "
+              L"thread; if the callee faults, the FAULTED flag is set on the "
+              L"return so you can tell.")
+       .arg(wclap::Arg(L"addr").positional().required().help(L"Function address (kernel VA)"))
+       .arg(wclap::Arg(L"a1").positional().help(L"RCX (optional)"))
+       .arg(wclap::Arg(L"a2").positional().help(L"RDX (optional)"))
+       .arg(wclap::Arg(L"a3").positional().help(L"R8  (optional)"))
+       .arg(wclap::Arg(L"a4").positional().help(L"R9  (optional)"));
+    auto m = app.parse(argc, argv);
+    uint64_t addr = *m.value_u64(L"addr");
     uint64_t a[4] = {0,0,0,0};
-    for (int i = 1; i < argc && i <= 4; ++i) a[i-1] = ParseU64(argv[i]);
+    if (auto v = m.value_u64(L"a1")) a[0] = *v;
+    if (auto v = m.value_u64(L"a2")) a[1] = *v;
+    if (auto v = m.value_u64(L"a3")) a[2] = *v;
+    if (auto v = m.value_u64(L"a4")) a[3] = *v;
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     auto r = s.kcall(addr, a[0], a[1], a[2], a[3]);
     if (!r) { fwprintf(stderr, L"kcall failed: %lu\n", ::GetLastError()); return 1; }
-    wprintf(L"ret=0x%016llx%s\n", (unsigned long long)r->returnValue, r->faulted ? L" (FAULTED)" : L"");
+    wprintf(L"ret=0x%016llx%ls\n", (unsigned long long)r->returnValue,
+            r->faulted ? L" (FAULTED)" : L"");
     return 0;
 }
 
 int CmdUnprotect(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"unprotect: unprotect <pid> [new-value] [offset]\n"); return 1; }
-    uint32_t pid = (uint32_t)ParseU64(argv[0]);
-    uint8_t newVal = 0;
-    uint32_t off = 0;
-    if (argc >= 2) newVal = (uint8_t)ParseU64(argv[1]);
-    if (argc >= 3) off = (uint32_t)ParseU64(argv[2]);
+    wclap::App app(L"winternal proc unlock");
+    app.about(L"Clear EPROCESS->Protection on a PID (the inverse of `proc lock`). "
+              L"Also pulls the PID out of the Ob handle-strip list if `proc lock "
+              L"--force` had added it. Pass `new-value` to write something other "
+              L"than zero (rarely useful). Pass `offset` to override the auto-"
+              L"detected Protection field offset -- normally leave it alone, the "
+              L"driver figures it out from EPROCESS structure-shape probing.")
+       .arg(wclap::Arg(L"pid").positional().required().help(L"Target PID"))
+       .arg(wclap::Arg(L"new-value").positional().help(L"New Protection byte (default 0)"))
+       .arg(wclap::Arg(L"offset").positional().help(L"EPROCESS field offset override (default: auto-detect)"));
+    auto m = app.parse(argc, argv);
+    uint32_t pid    = (uint32_t)*m.value_u64(L"pid");
+    uint8_t  newVal = 0;
+    uint32_t off    = 0;
+    if (auto v = m.value_u64(L"new-value")) newVal = (uint8_t)*v;
+    if (auto v = m.value_u64(L"offset"))    off    = (uint32_t)*v;
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     auto r = s.unprotectProcess(pid, newVal, off);
-    if (!r) { fwprintf(stderr, L"unprotect failed: %lu\n", ::GetLastError()); return 1; }
-    // Also remove from Ob-callback lock list if `protect --force` had added it.
-    // Errors ignored — the PID may simply not be locked.
+    if (!r) { fwprintf(stderr, L"proc unlock failed: %lu\n", ::GetLastError()); return 1; }
     s.protectUnlock(pid);
     wprintf(L"pid=%u offset=0x%x prev=0x%02x -> 0x%02x  (Ob lock cleared if present)\n",
             pid, r->fieldOffsetUsed, r->prevValue, newVal);
@@ -655,22 +790,22 @@ bool IsAllDigits(std::wstring_view s);
 bool EqualsCI(std::wstring_view a, std::wstring_view b);
 const ProcessInfo* FindByPid(const std::vector<ProcessInfo>& ps, uint32_t pid);
 
-// protect ------------------------------------------------------------------
+// proc lock ----------------------------------------------------------------
 //
-// `protect <pid>`              — set EPROCESS->Protection (PPL/PP); blocks
+// `proc lock <pid>`            — set EPROCESS->Protection (PPL/PP); blocks
 //                                 same-or-lower-protected user-mode callers.
-// `protect <pid> --force`      — also register an Ob pre-op callback that
+// `proc lock <pid> --force`    — also register an Ob pre-op callback that
 //                                 strips destructive + informational access
 //                                 from EVERY new user-mode open of the PID,
 //                                 and revokes existing destructive handles
 //                                 other processes already hold.
-// `protect <pid> --level N`    — override the Protection byte (default 0x72,
+// `proc lock <pid> --level N`  — override the Protection byte (default 0x72,
 //                                 PsProtectedSignerWinTcb-Full).
-// `protect --list`             — print currently force-protected PIDs.
+// `proc lock --list`           — print currently force-protected PIDs.
 //
 // The default level (0x72) and the Ob strip mask are picked for maximum
 // user-mode opacity; kernel-mode callers (including this driver) are
-// unaffected so the protection can always be cleared with `unprotect`.
+// unaffected so the protection can always be cleared with `proc unlock`.
 
 // Close every user-mode handle other processes already hold against the
 // kernel object identified by `targetObject`. Identification is by kernel
@@ -697,59 +832,62 @@ static uint32_t RevokeHandlesAgainstObject(uint64_t targetObject,
 }
 
 int CmdProtect(int argc, wchar_t** argv) {
-    bool list = false;
-    bool force = false;
-    uint8_t level = 0x72;   // PsProtectedSignerWinTcb-Full
-    std::wstring pidArg;
+    wclap::App app(L"winternal proc lock");
+    app.about(L"Set EPROCESS->Protection on a PID, making user-mode tools at "
+              L"the same or lower protection level unable to OpenProcess it "
+              L"for destructive access. The default level (0x72) is "
+              L"PsProtectedSignerWinTcb-Full -- effectively unkillable from "
+              L"any normal admin handle. With `--force` the driver ALSO "
+              L"installs an Ob handle-strip on the PID and revokes any "
+              L"destructive handles other processes already hold. Pass "
+              L"`--list` (with no PID) to print currently force-locked PIDs. "
+              L"Use `proc unlock` to undo.")
+       .arg(wclap::Arg(L"pid").positional().help(L"Target PID (omit with --list)"))
+       .arg(wclap::Arg(L"force").long_name(L"force")
+                .help(L"Add Ob callback strip + revoke existing destructive handles"))
+       .arg(wclap::Arg(L"level").long_name(L"level").takes_value()
+                .default_value(L"0x72")
+                .help(L"EPROCESS Protection byte (default 0x72 PsProtectedSignerWinTcb-Full)"))
+       .arg(wclap::Arg(L"list").long_name(L"list")
+                .help(L"Print all currently force-locked PIDs"));
+    auto m = app.parse(argc, argv);
+    bool list  = m.present(L"list");
+    bool force = m.present(L"force");
+    uint8_t level = (uint8_t)*m.value_u64(L"level");
+    auto pidArgOpt = m.value(L"pid");
 
-    for (int i = 0; i < argc; ++i) {
-        std::wstring_view a = argv[i];
-        if      (a == L"--list")  list = true;
-        else if (a == L"--force") force = true;
-        else if (a == L"--level" && i + 1 < argc) level = (uint8_t)ParseU64(argv[++i]);
-        else if (!a.empty() && a[0] == L'-') {
-            fwprintf(stderr, L"protect: unknown flag %s\n", argv[i]); return 1;
-        }
-        else if (pidArg.empty()) pidArg = argv[i];
-        else { fwprintf(stderr, L"protect: only one <pid> allowed\n"); return 1; }
-    }
-
-    Dbg(L"protect: pid=%s level=0x%02x force=%d list=%d",
-        pidArg.empty() ? L"(none)" : pidArg.c_str(), level, force, list);
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
-    Dbg(L"protect: driver session open");
 
     if (list) {
         auto pids = s.protectList();
-        if (pids.empty()) { wprintf(L"protect: no PIDs currently force-locked\n"); return 0; }
+        if (pids.empty()) { wprintf(L"proc lock: no PIDs currently force-locked\n"); return 0; }
         auto procs = EnumProcesses();
         wprintf(L"force-protected PIDs:\n");
         for (auto pid : pids) {
             auto* p = FindByPid(procs, pid);
-            wprintf(L"  %6u  %s\n", pid, p ? p->imageName.c_str() : L"(dead)");
+            wprintf(L"  %6u  %ls\n", pid, p ? p->imageName.c_str() : L"(dead)");
         }
         return 0;
     }
 
-    if (pidArg.empty()) {
-        fwprintf(stderr, L"protect <pid> [--level N] [--force]\n"
-                         L"protect --list\n");
+    if (!pidArgOpt) {
+        fwprintf(stderr, L"proc lock: <pid> required (or --list)\n"
+                         L"  see `proc lock --help`\n");
         return 1;
     }
-    if (!IsAllDigits(pidArg)) { fwprintf(stderr, L"protect: <pid> must be numeric\n"); return 1; }
-    uint32_t pid = (uint32_t)wcstoul(pidArg.c_str(), nullptr, 10);
+    uint32_t pid = (uint32_t)*m.value_u64(L"pid");
 
     // Always set the EPROCESS->Protection byte first — it's the weakest form
     // but also the one that survives if the Ob callback registration fails.
     auto r = s.unprotectProcess(pid, level, 0);   // same IOCTL, non-zero NewValue
-    if (!r) { fwprintf(stderr, L"protect: setProtection failed: %lu\n", ::GetLastError()); return 1; }
+    if (!r) { fwprintf(stderr, L"proc lock: setProtection failed: %lu\n", ::GetLastError()); return 1; }
     wprintf(L"pid=%u  Protection: 0x%02x -> 0x%02x\n", pid, r->prevValue, level);
 
     if (force) {
-        Dbg(L"protect --force: opening target pid=%u before lock", pid);
+        Dbg(L"proc lock --force: opening target pid=%u before lock", pid);
         HandleGuard self(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         if (!self.valid()) {
-            fwprintf(stderr, L"protect --force: cannot open pid %u (%lu); aborting before Ob lock\n",
+            fwprintf(stderr, L"proc lock --force: cannot open pid %u (%lu); aborting before Ob lock\n",
                      pid, ::GetLastError());
             return 1;
         }
@@ -763,10 +901,10 @@ int CmdProtect(int argc, wchar_t** argv) {
             }
         }
 
-        Dbg(L"protect --force: invoking protectLock IOCTL");
+        Dbg(L"proc lock --force: invoking protectLock IOCTL");
         if (!s.protectLock(pid)) {
             DWORD e = ::GetLastError();
-            fwprintf(stderr, L"protect --force: Ob callback registration failed (%lu).\n"
+            fwprintf(stderr, L"proc lock --force: Ob callback registration failed (%lu).\n"
                              L"  EPROCESS->Protection is still set; user-mode tools with equal\n"
                              L"  protection may still touch the process. Some Windows SKUs enforce\n"
                              L"  signing on ObRegisterCallbacks even with testsigning on.\n", e);
@@ -827,47 +965,37 @@ const ProcessInfo* FindByPid(const std::vector<ProcessInfo>& ps, uint32_t pid) {
     return nullptr;
 }
 
-void KkillUsage() {
-    fwprintf(stderr,
-        L"kkill <pid|name> [flags]\n"
-        L"  <pid>         numeric PID to terminate (driver IOCTL)\n"
-        L"  <name>        process name match (default: case-insensitive exact, e.g. notepad.exe)\n"
-        L"\n"
-        L"  --glob        treat <name> as a glob (`*`, `?`)\n"
-        L"  --all         when a name matches multiple PIDs, kill them all (default: refuse)\n"
-        L"  --tree, -t    also terminate every descendant of the target(s)\n"
-        L"  --dry-run     list targets without killing\n"
-        L"  --exit-code N pass N to ZwTerminateProcess (default: 1)\n");
-}
-
 int CmdKkill(int argc, wchar_t** argv) {
-    std::wstring target;
-    bool useGlob = false;
-    bool killAll = false;
-    bool tree    = false;
-    bool dryRun  = false;
-    uint32_t exitCode = 1;
-
-    for (int i = 0; i < argc; ++i) {
-        std::wstring_view a = argv[i];
-        if      (a == L"--glob")      useGlob = true;
-        else if (a == L"--all")       killAll = true;
-        else if (a == L"--tree" || a == L"-t") tree = true;
-        else if (a == L"--dry-run")   dryRun = true;
-        else if (a == L"--exit-code" && i + 1 < argc) exitCode = ParseUint(argv[++i]);
-        else if (!a.empty() && a[0] == L'-') {
-            fwprintf(stderr, L"kkill: unknown flag %s\n", argv[i]);
-            KkillUsage();
-            return 1;
-        }
-        else if (target.empty()) target = argv[i];
-        else {
-            fwprintf(stderr, L"kkill: only one positional <pid|name> allowed\n");
-            return 1;
-        }
-    }
-
-    if (target.empty()) { KkillUsage(); return 1; }
+    wclap::App app(L"winternal proc kkill");
+    app.about(L"Driver-side process kill. The user-mode TerminateProcess path "
+              L"is blocked for protected processes (PPL/PP, processes guarded "
+              L"by another EDR's Ob callbacks, etc.); this routes through "
+              L"the Winternal driver which calls PsLookupProcessByProcessId + "
+              L"NtTerminateProcess from kernel mode -- access checks are "
+              L"skipped because the previous mode is KernelMode. The PPL "
+              L"signing level is irrelevant since the driver is the caller. "
+              L"Target by PID (numeric) or by image name (default: case-"
+              L"insensitive exact). Use `--glob` for wildcards, `--tree` to "
+              L"also kill descendants, and `--dry-run` to preview.")
+       .arg(wclap::Arg(L"target").positional().required()
+                .help(L"PID (numeric) or image name (e.g. notepad.exe)"))
+       .arg(wclap::Arg(L"glob").long_name(L"glob")
+                .help(L"Treat <target> as a glob (* and ? wildcards)"))
+       .arg(wclap::Arg(L"all").long_name(L"all")
+                .help(L"When a name matches multiple PIDs, kill them all (default: refuse)"))
+       .arg(wclap::Arg(L"tree").long_name(L"tree").short_name(L't')
+                .help(L"Also terminate every descendant of the target(s)"))
+       .arg(wclap::Arg(L"dry-run").long_name(L"dry-run")
+                .help(L"Print the resolved target list without killing"))
+       .arg(wclap::Arg(L"exit-code").long_name(L"exit-code").takes_value().default_value(L"1")
+                .help(L"Exit code passed to ZwTerminateProcess"));
+    auto m = app.parse(argc, argv);
+    std::wstring target = *m.value(L"target");
+    bool useGlob = m.present(L"glob");
+    bool killAll = m.present(L"all");
+    bool tree    = m.present(L"tree");
+    bool dryRun  = m.present(L"dry-run");
+    uint32_t exitCode = (uint32_t)*m.value_u64(L"exit-code");
 
     Dbg(L"kkill: target=%s glob=%d all=%d tree=%d dryRun=%d exitCode=%u",
         target.c_str(), useGlob, killAll, tree, dryRun, exitCode);
@@ -890,12 +1018,12 @@ int CmdKkill(int argc, wchar_t** argv) {
             if (match) seeds.push_back(p.pid);
         }
         if (seeds.empty()) {
-            fwprintf(stderr, L"kkill: no process matches '%s'%s\n",
+            fwprintf(stderr, L"proc kkill: no process matches '%s'%s\n",
                      target.c_str(), useGlob ? L"" : L" (pass --glob for wildcards)");
             return 1;
         }
         if (seeds.size() > 1 && !killAll) {
-            fwprintf(stderr, L"kkill: '%s' matches %zu processes; pass --all to kill them all:\n",
+            fwprintf(stderr, L"proc kkill: '%s' matches %zu processes; pass --all to kill them all:\n",
                      target.c_str(), seeds.size());
             for (auto pid : seeds) {
                 auto* p = FindByPid(procs, pid);
@@ -983,16 +1111,27 @@ int CmdKkill(int argc, wchar_t** argv) {
 }
 
 int CmdCallbacks(int argc, wchar_t** argv) {
-    CallbackKind kind = CallbackKind::Process;
-    if (argc >= 1) {
-        if (wcscmp(argv[0], L"process") == 0) kind = CallbackKind::Process;
-        else if (wcscmp(argv[0], L"image") == 0) kind = CallbackKind::Image;
-        else if (wcscmp(argv[0], L"thread") == 0) kind = CallbackKind::Thread;
-        else { fwprintf(stderr, L"callbacks: kind must be process|image|thread\n"); return 1; }
-    }
+    wclap::App app(L"winternal callbacks");
+    app.about(L"Dump kernel notify-routine arrays. The kernel keeps three "
+              L"arrays of \"hey, a process/image/thread just happened\" "
+              L"callbacks, registered via PsSetCreate{Process|Thread}Notify"
+              L"Routine and PsSetLoadImageNotifyRoutine. Each entry is a "
+              L"<routine, owning-module> pair; this is how EDR products know "
+              L"about every load. Rootkits also love to insert themselves "
+              L"here, so unexpected entries are a red flag.")
+       .arg(wclap::Arg(L"kind").positional().default_value(L"process")
+                .help(L"process | image | thread (default: process)"));
+    auto m = app.parse(argc, argv);
+    std::wstring kindStr = *m.value(L"kind");
+    CallbackKind kind;
+    if      (kindStr == L"process") kind = CallbackKind::Process;
+    else if (kindStr == L"image")   kind = CallbackKind::Image;
+    else if (kindStr == L"thread")  kind = CallbackKind::Thread;
+    else { fwprintf(stderr, L"callbacks: kind must be process|image|thread (got '%ls')\n", kindStr.c_str()); return 1; }
+
     DriverSession s; if (!OpenDriverOrHint(s)) return 1;
     auto cbs = s.enumCallbacks(kind);
-    wprintf(L"%-3s %-18s %-18s %s\n", L"#", L"Routine", L"ModBase", L"Module");
+    wprintf(L"%-3ls %-18ls %-18ls %ls\n", L"#", L"Routine", L"ModBase", L"Module");
     int i = 0;
     for (auto& c : cbs) {
         wprintf(L"%3d 0x%016llx 0x%016llx %S\n",
@@ -1124,26 +1263,32 @@ static std::vector<GhostInfo> DetectGhosts() {
 }
 
 int CmdGhost(int argc, wchar_t** argv) {
-    bool killAll  = false;
-    bool yes      = false;
+    wclap::App app(L"winternal proc ghost");
+    app.about(L"Detect and optionally kill processes the OS is hiding. Three "
+              L"vectors are checked:\n"
+              L"  HIDDEN     PID enumerated by the driver but missing from\n"
+              L"             user-mode NtQSI -- classic DKOM unlink\n"
+              L"  ZOMBIE     PEPROCESS exists with zero threads (process\n"
+              L"             record kept alive only by outstanding handles)\n"
+              L"  IMG-GONE   process is running but its on-disk image file\n"
+              L"             has been deleted (`process hollowing` leftover)\n"
+              L"\n"
+              L"With no flags this just lists. `--kill <pid>` kills one named\n"
+              L"ghost (PID must be in the list -- safety check). `--kill-all`\n"
+              L"kills every ghost; `--yes` skips the confirmation prompt that\n"
+              L"`--kill-all` otherwise asks for.")
+       .arg(wclap::Arg(L"kill").long_name(L"kill").takes_value()
+                .help(L"Kill exactly this PID (must be currently listed as a ghost)"))
+       .arg(wclap::Arg(L"kill-all").long_name(L"kill-all")
+                .help(L"Kill every detected ghost"))
+       .arg(wclap::Arg(L"yes").long_name(L"yes").short_name(L'y')
+                .help(L"Skip --kill-all's confirmation prompt"));
+    auto m = app.parse(argc, argv);
+    bool killAll = m.present(L"kill-all");
+    bool yes     = m.present(L"yes");
     uint32_t killOne = 0;
     bool haveKillOne = false;
-
-    for (int i = 0; i < argc; ++i) {
-        std::wstring_view a = argv[i];
-        if      (a == L"--kill-all")        killAll = true;
-        else if (a == L"--yes" || a == L"-y") yes = true;
-        else if (a == L"--kill" && i + 1 < argc) {
-            killOne = ParseUint(argv[++i]);
-            haveKillOne = true;
-        }
-        else {
-            fwprintf(stderr, L"ghost: unknown arg %s\n", argv[i]);
-            fwprintf(stderr,
-                L"usage: winternal ghost [--kill <pid>] [--kill-all] [--yes|-y]\n");
-            return 1;
-        }
-    }
+    if (auto v = m.value_u64(L"kill")) { killOne = (uint32_t)*v; haveKillOne = true; }
 
     Dbg(L"ghost: killAll=%d yes=%d kill=%u%s", killAll, yes, killOne, haveKillOne ? L" set" : L"");
     auto ghosts = DetectGhosts();
@@ -1181,7 +1326,7 @@ int CmdGhost(int argc, wchar_t** argv) {
             if (g.pid == killOne) return killOnePid(g.pid, g.name.c_str()) ? 0 : 1;
         }
         fwprintf(stderr,
-            L"ghost --kill %u: PID is not in the ghost list (run `winternal ghost` first).\n",
+            L"ghost --kill %u: PID is not in the ghost list (run `winternal proc ghost` first).\n",
             killOne);
         return 1;
     }
@@ -1281,26 +1426,29 @@ static HWND ParseHwnd(const wchar_t* s) {
 }
 
 static int CmdWinList(int argc, wchar_t** argv) {
-    Dbg(L"win list: argc=%d", argc);
+    wclap::App app(L"winternal win list");
+    app.about(L"Enumerate top-level windows. Filters compose (AND); --title "
+              L"and --class use glob syntax (* and ? wildcards).")
+       .arg(wclap::Arg(L"pid").long_name(L"pid").takes_value().help(L"Restrict to one PID"))
+       .arg(wclap::Arg(L"title").long_name(L"title").takes_value().help(L"Title glob filter"))
+       .arg(wclap::Arg(L"class").long_name(L"class").takes_value().help(L"Window-class glob filter"))
+       .arg(wclap::Arg(L"visible").long_name(L"visible").help(L"Only IsWindowVisible() == TRUE"));
+    auto m = app.parse(argc, argv);
     DWORD pid = 0;
-    const wchar_t* titlePat = nullptr;
-    const wchar_t* classPat = nullptr;
-    bool visibleOnly = false;
-    for (int i = 0; i < argc; ++i) {
-        std::wstring_view a = argv[i];
-        if      (a == L"--pid"     && i + 1 < argc) pid = ParseUint(argv[++i]);
-        else if (a == L"--title"   && i + 1 < argc) titlePat = argv[++i];
-        else if (a == L"--class"   && i + 1 < argc) classPat = argv[++i];
-        else if (a == L"--visible") visibleOnly = true;
-        else { fwprintf(stderr, L"win list: unknown arg %s\n", argv[i]); return 1; }
-    }
+    if (auto v = m.value_u64(L"pid")) pid = (DWORD)*v;
+    auto titleS = m.value(L"title");
+    auto classS = m.value(L"class");
+    const wchar_t* titlePat = titleS ? titleS->c_str() : nullptr;
+    const wchar_t* classPat = classS ? classS->c_str() : nullptr;
+    bool visibleOnly = m.present(L"visible");
+
     std::vector<WinRow> rows;
     WinCollect ctx{ &rows, pid, titlePat, classPat, visibleOnly };
     ::EnumWindows(WinCollectProc, (LPARAM)&ctx);
 
-    wprintf(L"%-18s %-6s %-3s %-22s %s\n", L"HWND", L"PID", L"V", L"CLASS", L"TITLE");
+    wprintf(L"%-18ls %-6ls %-3ls %-22ls %ls\n", L"HWND", L"PID", L"V", L"CLASS", L"TITLE");
     for (auto& r : rows) {
-        wprintf(L"0x%016llx %-6lu %-3s %-22.22s %s\n",
+        wprintf(L"0x%016llx %-6lu %-3ls %-22.22ls %ls\n",
                 (unsigned long long)(uintptr_t)r.hwnd,
                 r.pid,
                 r.visible ? L"y" : L"n",
@@ -1311,9 +1459,14 @@ static int CmdWinList(int argc, wchar_t** argv) {
 }
 
 static int CmdWinInfo(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win info <hwnd>\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
-    if (!::IsWindow(h)) { fwprintf(stderr, L"win info: not a window: %s\n", argv[0]); return 1; }
+    wclap::App app(L"winternal win info");
+    app.about(L"Dump a window's properties: owning PID/TID, style, ex-style, "
+              L"rect, parent and owner HWND, and the image name of the "
+              L"owning process.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle (decimal or 0xHEX)"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
+    if (!::IsWindow(h)) { fwprintf(stderr, L"win info: not a window\n"); return 1; }
 
     DWORD pid = 0;
     DWORD tid = ::GetWindowThreadProcessId(h, &pid);
@@ -1347,8 +1500,14 @@ static int CmdWinInfo(int argc, wchar_t** argv) {
 }
 
 static int CmdWinClose(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win close <hwnd>\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win close");
+    app.about(L"Post WM_CLOSE to a window. The owner's message loop decides "
+              L"what to happen -- modal save prompts, lingering message "
+              L"pumps that ignore close, etc. For a force-kill that survives "
+              L"an unresponsive owner use `win kill`.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win close: not a window\n"); return 1; }
     if (!::PostMessageW(h, WM_CLOSE, 0, 0)) {
         fwprintf(stderr, L"win close: PostMessage failed (%lu)\n", ::GetLastError()); return 1;
@@ -1358,8 +1517,14 @@ static int CmdWinClose(int argc, wchar_t** argv) {
 }
 
 static int CmdWinKill(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win kill <hwnd>\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win kill");
+    app.about(L"WM_CLOSE the window first; if its owner is still alive 500ms "
+              L"later, escalate to a driver-side PsTerminateProcess on the "
+              L"owning PID. Works on PPL/PP processes that won't honor a "
+              L"polite close.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win kill: not a window\n"); return 1; }
     DWORD pid = 0;
     ::GetWindowThreadProcessId(h, &pid);
@@ -1384,16 +1549,32 @@ static int CmdWinKill(int argc, wchar_t** argv) {
     return 0;
 }
 
-static int CmdWinShowHide(const wchar_t* hwndArg, int cmd) {
-    HWND h = ParseHwnd(hwndArg);
+static int CmdWinShowHide(int argc, wchar_t** argv, int cmd) {
+    bool hiding = (cmd == SW_HIDE);
+    wclap::App app(hiding ? L"winternal win hide" : L"winternal win show");
+    app.about(hiding
+        ? L"ShowWindow(SW_HIDE) -- removes the window from the screen and "
+          L"taskbar without ending the owning process. Inverse of `win show`."
+        : L"ShowWindow(SW_SHOWNA) -- show a previously-hidden window without "
+          L"activating it (no focus steal). Inverse of `win hide`.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win: not a window\n"); return 1; }
     ::ShowWindow(h, cmd);
     return 0;
 }
 
 static int CmdWinFront(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win front <hwnd>\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win front");
+    app.about(L"Force a window to the foreground. SetForegroundWindow is "
+              L"rate-limited by Windows; we work around that with the classic "
+              L"AttachThreadInput trick (briefly attach our input thread to "
+              L"the foreground thread's input queue, then call SFW). Also "
+              L"restores if minimized.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win front: not a window\n"); return 1; }
     // SetForegroundWindow is rate-limited by Windows. Attach our input
     // thread to the target's thread first — that bypasses the lockout.
@@ -1408,15 +1589,24 @@ static int CmdWinFront(int argc, wchar_t** argv) {
 }
 
 static int CmdWinTopmost(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win topmost <hwnd> [off]\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win topmost");
+    app.about(L"Toggle WS_EX_TOPMOST on a window. Topmost windows stay above "
+              L"all non-topmost windows regardless of focus. Pass `off` (or "
+              L"`false` / `0`) to clear; with no second arg, sets topmost on.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"))
+       .arg(wclap::Arg(L"state").positional().help(L"`off` / `false` / `0` to clear; default is set"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win topmost: not a window\n"); return 1; }
-    bool off = (argc >= 2 && (EqualsCI(argv[1], L"off") || EqualsCI(argv[1], L"false") || EqualsCI(argv[1], L"0")));
+    bool off = false;
+    if (auto s = m.value(L"state")) {
+        off = EqualsCI(*s, L"off") || EqualsCI(*s, L"false") || EqualsCI(*s, L"0");
+    }
     if (!::SetWindowPos(h, off ? HWND_NOTOPMOST : HWND_TOPMOST,
                         0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
         fwprintf(stderr, L"win topmost: SetWindowPos failed (%lu)\n", ::GetLastError()); return 1;
     }
-    wprintf(L"topmost = %s\n", off ? L"off" : L"on");
+    wprintf(L"topmost = %ls\n", off ? L"off" : L"on");
     return 0;
 }
 
@@ -1608,23 +1798,40 @@ private:
 };
 
 static int CmdWinZbid(int argc, wchar_t** argv) {
-    if (argc < 1) { fwprintf(stderr, L"win zbid <hwnd> [band 0..18]\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win zbid");
+    app.about(L"Read or set the window's Z-band -- an undocumented user32 "
+              L"dimension above the normal Z-order. With no <band>, prints "
+              L"the current band. With <band>, sets it, climbing an access "
+              L"ladder through UIAccess flip, MS signature spoof, and tag-"
+              L"PROCESSINFO immersive-broker bit if user32 refuses the "
+              L"plain call. Known bands:\n"
+              L"  0 DEFAULT     7 IMMERSIVE_EDGY        13 IMMERSIVE_SEARCH\n"
+              L"  1 DESKTOP     8 IMMERSIVE_INACTMOBOD  14 GENUINE_WINDOWS\n"
+              L"  2 UIACCESS    9 IMMERSIVE_INACTDOCK   15 IMMERSIVE_RESTRICTED\n"
+              L"  3 IMM_IHM    10 IMMERSIVE_ACTMOBODY   16 SYSTEM_TOOLS\n"
+              L"  4 IMM_NOTIF  11 IMMERSIVE_ACTDOCK     17 LOCK\n"
+              L"  5 IMM_CHROME 12 IMMERSIVE_BACKGROUND  18 ABOVELOCK_UX\n"
+              L"  6 IMM_MOGO")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"))
+       .arg(wclap::Arg(L"band").positional().help(L"Band 0..18 (omit to read current)"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win zbid: not a window\n"); return 1; }
     HMODULE u32 = ::GetModuleHandleW(L"user32.dll");
 
-    if (argc == 1) {
+    auto bandOpt = m.value_u64(L"band");
+    if (!bandOpt) {
         auto fn = (PFN_GetWindowBand)::GetProcAddress(u32, "GetWindowBand");
         if (!fn) { fwprintf(stderr, L"win zbid: user32!GetWindowBand not exported on this build\n"); return 1; }
         DWORD band = 0;
         if (!fn(h, &band)) { fwprintf(stderr, L"win zbid: GetWindowBand failed (%lu)\n", ::GetLastError()); return 1; }
-        wprintf(L"zbid = %lu  (%s)\n", band, ZbidName(band));
+        wprintf(L"zbid = %lu  (%ls)\n", band, ZbidName(band));
         return 0;
     }
 
     auto fn = (PFN_SetWindowBand)::GetProcAddress(u32, "SetWindowBand");
     if (!fn) { fwprintf(stderr, L"win zbid: user32!SetWindowBand not exported on this build\n"); return 1; }
-    DWORD band = (DWORD)ParseU64(argv[1]);
+    DWORD band = (DWORD)*bandOpt;
 
     Dbg(L"zbid: stage 0 — calling user32!SetWindowBand directly");
     if (fn(h, NULL, band)) {
@@ -1749,33 +1956,35 @@ static const wchar_t* AffinityName(DWORD a) {
 }
 
 static int CmdWinPrivacy(int argc, wchar_t** argv) {
-    if (argc < 1) {
-        fwprintf(stderr,
-            L"win privacy <hwnd>                       show current state\n"
-            L"win privacy <hwnd> <none|monitor|hide>   set state\n");
-        return 1;
-    }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win privacy");
+    app.about(L"Read or set a window's display affinity -- the anti-screen-"
+              L"capture flag. With no <mode>, prints the current setting. "
+              L"Modes:\n"
+              L"  none      WDA_NONE                -- normal, capturable\n"
+              L"  monitor   WDA_MONITOR             -- excluded from monitor capture\n"
+              L"  hide      WDA_EXCLUDEFROMCAPTURE  -- excluded from all capture\n"
+              L"            (DWM still shows black in screenshots/recording)")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"))
+       .arg(wclap::Arg(L"mode").positional().help(L"none | monitor | hide (omit to read current)"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win privacy: not a window\n"); return 1; }
 
-    if (argc == 1) {
-        // GetWindowDisplayAffinity is exported on the same builds as Set,
-        // but we resolve via GetProcAddress to keep the binary loadable on
-        // older targets (delay-loading user32 is more pain than it's worth).
+    auto modeOpt = m.value(L"mode");
+    if (!modeOpt) {
         HMODULE u32 = ::GetModuleHandleW(L"user32.dll");
         auto fn = (PFN_GetWindowDisplayAffinity)::GetProcAddress(u32, "GetWindowDisplayAffinity");
         if (!fn) { fwprintf(stderr, L"win privacy: user32!GetWindowDisplayAffinity unavailable\n"); return 1; }
         DWORD a = 0;
         if (!fn(h, &a)) { fwprintf(stderr, L"win privacy: GetWindowDisplayAffinity failed (%lu)\n", ::GetLastError()); return 1; }
-        wprintf(L"privacy = 0x%02lx  (%s)\n", a, AffinityName(a));
+        wprintf(L"privacy = 0x%02lx  (%ls)\n", a, AffinityName(a));
         return 0;
     }
 
-    std::wstring_view mode = argv[1];
     DWORD a;
-    if      (EqualsCI(mode, L"none"))    a = WDA_NONE;
-    else if (EqualsCI(mode, L"monitor")) a = WDA_MONITOR;
-    else if (EqualsCI(mode, L"hide") || EqualsCI(mode, L"exclude")) a = WDA_EXCLUDEFROMCAPTURE;
+    if      (EqualsCI(*modeOpt, L"none"))    a = WDA_NONE;
+    else if (EqualsCI(*modeOpt, L"monitor")) a = WDA_MONITOR;
+    else if (EqualsCI(*modeOpt, L"hide") || EqualsCI(*modeOpt, L"exclude")) a = WDA_EXCLUDEFROMCAPTURE;
     else { fwprintf(stderr, L"win privacy: mode must be none|monitor|hide\n"); return 1; }
 
     if (!::SetWindowDisplayAffinity(h, a)) {
@@ -1783,23 +1992,28 @@ static int CmdWinPrivacy(int argc, wchar_t** argv) {
                  a, ::GetLastError());
         return 1;
     }
-    wprintf(L"privacy -> 0x%02lx (%s)\n", a, AffinityName(a));
+    wprintf(L"privacy -> 0x%02lx (%ls)\n", a, AffinityName(a));
     return 0;
 }
 
 static int CmdWinMove(int argc, wchar_t** argv) {
-    if (argc < 3) { fwprintf(stderr, L"win move <hwnd> <x> <y> [w h]\n"); return 1; }
-    HWND h = ParseHwnd(argv[0]);
+    wclap::App app(L"winternal win move");
+    app.about(L"SetWindowPos a window. <x> <y> reposition; optional <w> <h> "
+              L"also resize. Flags applied: SWP_NOZORDER | SWP_NOACTIVATE.")
+       .arg(wclap::Arg(L"hwnd").positional().required().help(L"Window handle"))
+       .arg(wclap::Arg(L"x").positional().required().help(L"Left edge in screen px"))
+       .arg(wclap::Arg(L"y").positional().required().help(L"Top edge in screen px"))
+       .arg(wclap::Arg(L"w").positional().help(L"Width (optional)"))
+       .arg(wclap::Arg(L"h").positional().help(L"Height (optional)"));
+    auto m = app.parse(argc, argv);
+    HWND h = ParseHwnd(m.value(L"hwnd")->c_str());
     if (!::IsWindow(h)) { fwprintf(stderr, L"win move: not a window\n"); return 1; }
-    int x = (int)ParseU64(argv[1]);
-    int y = (int)ParseU64(argv[2]);
+    int x = (int)*m.value_u64(L"x");
+    int y = (int)*m.value_u64(L"y");
     UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
     int w = 0, ht = 0;
-    if (argc >= 5) {
-        w  = (int)ParseU64(argv[3]);
-        ht = (int)ParseU64(argv[4]);
-        flags &= ~SWP_NOSIZE;
-    }
+    if (auto vw = m.value_u64(L"w"); vw) { w = (int)*vw; }
+    if (auto vh = m.value_u64(L"h"); vh) { ht = (int)*vh; if (w) flags &= ~SWP_NOSIZE; }
     if (!::SetWindowPos(h, nullptr, x, y, w, ht, flags)) {
         fwprintf(stderr, L"win move: SetWindowPos failed (%lu)\n", ::GetLastError()); return 1;
     }
@@ -1808,20 +2022,21 @@ static int CmdWinMove(int argc, wchar_t** argv) {
 
 int CmdWin(int argc, wchar_t** argv) {
     if (argc < 1) {
-        fwprintf(stderr,
-            L"usage: winternal win <subcommand> [args]\n"
-            L"  list [--pid N] [--title PAT] [--class PAT] [--visible]\n"
-            L"  info  <hwnd>\n"
-            L"  close <hwnd>                  WM_CLOSE (polite)\n"
-            L"  kill  <hwnd>                  WM_CLOSE + driver kkill if it survives\n"
-            L"  hide  <hwnd>                  ShowWindow(SW_HIDE)\n"
-            L"  show  <hwnd>                  ShowWindow(SW_SHOWNA)\n"
-            L"  front <hwnd>                  set foreground (with attach-input bypass)\n"
-            L"  topmost <hwnd> [off]          toggle WS_EX_TOPMOST\n"
-            L"  zbid <hwnd> [band 0..18]      read or set the internal Z-band (above topmost)\n"
-            L"  privacy <hwnd> [none|monitor|hide]\n"
-            L"                                read or set screen-capture display affinity\n"
-            L"  move  <hwnd> <x> <y> [w h]    reposition (and optionally resize)\n");
+        wclap::App app(L"winternal win");
+        app.about(L"HWND operations -- everything that targets a top-level "
+                  L"window. Run any subcommand with --help for its argument doc.")
+           .subcommand(wclap::App(L"list").about(L"Enumerate top-level windows"))
+           .subcommand(wclap::App(L"info").about(L"Dump a window's properties"))
+           .subcommand(wclap::App(L"close").about(L"WM_CLOSE -- polite, owner may save state"))
+           .subcommand(wclap::App(L"kill").about(L"WM_CLOSE + driver kkill if it survives"))
+           .subcommand(wclap::App(L"hide").about(L"ShowWindow(SW_HIDE)"))
+           .subcommand(wclap::App(L"show").about(L"ShowWindow(SW_SHOWNA)"))
+           .subcommand(wclap::App(L"front").about(L"Bring to foreground (attach-input bypass)"))
+           .subcommand(wclap::App(L"topmost").about(L"Toggle WS_EX_TOPMOST"))
+           .subcommand(wclap::App(L"zbid").about(L"Read/set the internal Z-band (above topmost)"))
+           .subcommand(wclap::App(L"privacy").about(L"Set display affinity (anti-screen-cap)"))
+           .subcommand(wclap::App(L"move").about(L"Reposition (and optionally resize)"));
+        app.print_help(stderr);
         return 1;
     }
     std::wstring_view sub = argv[0];
@@ -1832,8 +2047,8 @@ int CmdWin(int argc, wchar_t** argv) {
     if (sub == L"info")    return CmdWinInfo(rest, ra);
     if (sub == L"close")   return CmdWinClose(rest, ra);
     if (sub == L"kill")    return CmdWinKill(rest, ra);
-    if (sub == L"hide")    return rest >= 1 ? CmdWinShowHide(ra[0], SW_HIDE)   : (fwprintf(stderr, L"win hide <hwnd>\n"), 1);
-    if (sub == L"show")    return rest >= 1 ? CmdWinShowHide(ra[0], SW_SHOWNA) : (fwprintf(stderr, L"win show <hwnd>\n"), 1);
+    if (sub == L"hide")    return CmdWinShowHide(rest, ra, SW_HIDE);
+    if (sub == L"show")    return CmdWinShowHide(rest, ra, SW_SHOWNA);
     if (sub == L"front")   return CmdWinFront(rest, ra);
     if (sub == L"topmost") return CmdWinTopmost(rest, ra);
     if (sub == L"zbid")    return CmdWinZbid(rest, ra);
@@ -2479,6 +2694,8 @@ static int CmdProcProtect(int argc, wchar_t** argv) {
 int CmdTree(int argc, wchar_t** argv);
 int CmdThreads(int argc, wchar_t** argv);
 int CmdMem(int argc, wchar_t** argv);
+int CmdToken(int argc, wchar_t** argv);
+int CmdMitigations(int argc, wchar_t** argv);
 
 int RunProcCommand(int argc, wchar_t** argv) {
     if (argc < 1) {
@@ -2496,6 +2713,10 @@ int RunProcCommand(int argc, wchar_t** argv) {
            .subcommand(wclap::App(L"lock").about(L"Strip kill rights from a PID (Ob handle filter)"))
            .subcommand(wclap::App(L"unlock").about(L"Reverse of `proc lock`"))
            .subcommand(wclap::App(L"ghost").about(L"Detect PIDs hidden from NtQSI"))
+           .subcommand(wclap::App(L"dlls").about(L"List loaded modules in a process (PEB LDR walk)"))
+           .subcommand(wclap::App(L"hooks").about(L"Scan IAT (and optionally inline) hooks in a process"))
+           .subcommand(wclap::App(L"token").about(L"Token info: integrity, elevation, UIAccess, privs, SID"))
+           .subcommand(wclap::App(L"mitigations").about(L"DEP/ASLR/CFG/shadow-stack/signing policies"))
            .subcommand(wclap::App(L"monitor").about(L"Live process create/exit/terminate stream"))
            .subcommand(wclap::App(L"rule").about(L"Manage process-create block/log rules"))
            .subcommand(wclap::App(L"protect").about(L"Prohibit termination by image-path pattern"));
@@ -2505,11 +2726,15 @@ int RunProcCommand(int argc, wchar_t** argv) {
     std::wstring_view sub = argv[0];
     int sa = argc - 1;
     wchar_t** av = argv + 1;
-    // Inspection & enumeration
+    // Inspection & enumeration (per-PID)
     if (sub == L"tree")                     return CmdTree(sa, av);
     if (sub == L"threads")                  return CmdThreads(sa, av);
     if (sub == L"mem")                      return CmdMem(sa, av);
     if (sub == L"ghost" || sub == L"ghosts")return CmdGhost(sa, av);
+    if (sub == L"dlls")                     { CmdDlls(sa, av); return 0; }
+    if (sub == L"hooks")                    { CmdHooks(sa, av); return 0; }
+    if (sub == L"token")                    return CmdToken(sa, av);
+    if (sub == L"mitigations")              return CmdMitigations(sa, av);
     // Lifecycle
     if (sub == L"kill")                     return CmdKill(sa, av);
     if (sub == L"kkill")                    return CmdKkill(sa, av);
@@ -2528,7 +2753,7 @@ int RunProcCommand(int argc, wchar_t** argv) {
 }
 
 int CmdTree(int argc, wchar_t** argv) {
-    wclap::App app(L"winternal tree");
+    wclap::App app(L"winternal proc tree");
     app.about(L"ASCII process tree. Defaults to kernel-side PID enum (DKOM-resistant) "
               L"if Winternal.sys is loaded, falls back to user-mode NtQSI otherwise.")
        .arg(wclap::Arg(L"user").long_name(L"user").help(L"Force user-mode enum (skip driver)"));
@@ -2638,7 +2863,7 @@ static const wchar_t* WaitReasonName(uint32_t r) {
 }
 
 int CmdThreads(int argc, wchar_t** argv) {
-    wclap::App app(L"winternal threads");
+    wclap::App app(L"winternal proc threads");
     app.about(L"List a process's threads via the driver (kernel-mode "
               L"ZwQuerySystemInformation — bypasses user-mode hooks).")
        .arg(wclap::Arg(L"pid").positional().required().help(L"Process ID"));
@@ -2698,7 +2923,7 @@ static const wchar_t* TypeName(DWORD t) {
 }
 
 int CmdMem(int argc, wchar_t** argv) {
-    wclap::App app(L"winternal mem");
+    wclap::App app(L"winternal proc mem");
     app.about(L"VirtualQueryEx-equivalent walk via the driver (KeStackAttach + "
               L"ZwQueryVirtualMemory), so PPL/protected targets resolve too.")
        .arg(wclap::Arg(L"pid").positional().required().help(L"Process ID"))
@@ -2784,7 +3009,7 @@ static const wchar_t* IntegrityLabel(DWORD rid) {
 }
 
 int CmdToken(int argc, wchar_t** argv) {
-    wclap::App app(L"winternal token");
+    wclap::App app(L"winternal proc token");
     app.about(L"Token user/integrity/privileges via driver "
               L"(ZwOpenProcessTokenEx + ZwQueryInformationToken in kernel).")
        .arg(wclap::Arg(L"pid").positional().required().help(L"Process ID"));
@@ -2847,7 +3072,7 @@ int CmdToken(int argc, wchar_t** argv) {
 #endif
 
 int CmdMitigations(int argc, wchar_t** argv) {
-    wclap::App app(L"winternal mitigations");
+    wclap::App app(L"winternal proc mitigations");
     app.about(L"Process mitigation policies via driver "
               L"(ZwQueryInformationProcess(ProcessMitigationPolicy) in kernel).")
        .arg(wclap::Arg(L"pid").positional().required().help(L"Process ID"));
@@ -2879,14 +3104,11 @@ int CmdMitigations(int argc, wchar_t** argv) {
     return 0;
 }
 
-int CmdClose(int argc, wchar_t** argv) {
-    if (argc < 2) { fwprintf(stderr, L"close: need <pid> <handle>\n"); return 1; }
-    uint32_t pid = ParseUint(argv[0]);
-    uint32_t hv = ParseUint(argv[1]);
-    if (CloseHandleInProcess(pid, hv)) { wprintf(L"Closed handle 0x%x in pid %u\n", hv, pid); return 0; }
-    fwprintf(stderr, L"Close failed: %S\n", FormatError(GetLastError()).c_str());
-    return 1;
-}
+// CmdClose was removed -- closing a handle inside another process now
+// lives under `handles close <pid> <hv>`, where it belongs. The `close`
+// name at the top level was confusing because it sounded window-related
+// when the operation is purely handle-table manipulation; window
+// closing is under `win close <hwnd>`.
 
 } // namespace
 
@@ -2927,16 +3149,12 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"help" || cmd == L"-h" || cmd == L"--help") { PrintHelp(); return 0; }
     if (cmd == L"ps")      { CmdPs(sub, sa); return 0; }
-    if (cmd == L"dlls")    { CmdDlls(sub, sa); return 0; }
+    // dlls / hooks / token / mitigations moved under `proc` (per-PID).
     if (cmd == L"drivers") { CmdDrivers(); return 0; }
     if (cmd == L"svc")     { CmdSvc(sub, sa); return 0; }
     if (cmd == L"net")     { CmdNet(); return 0; }
     if (cmd == L"handles") { CmdHandles(sub, sa); return 0; }
     if (cmd == L"obj")     { CmdObj(sub, sa); return 0; }
-    if (cmd == L"hooks")   { CmdHooks(sub, sa); return 0; }
-    // kill/suspend/resume moved under `proc`; close stays here -- it's a
-    // window operation, not a process operation.
-    if (cmd == L"close")   { return CmdClose(sub, sa); }
     if (cmd == L"kver")      { return CmdKver(); }
     if (cmd == L"kpids")     { return CmdKpids(); }
     if (cmd == L"kr")        { return CmdKread(sub, sa); }
@@ -2948,8 +3166,6 @@ int wmain(int argc, wchar_t** argv) {
     // unprotect/protect/kkill/ghost/tree/threads/mem all live under `proc` now.
     if (cmd == L"win")       { return CmdWin(sub, sa); }
     if (cmd == L"proc")        { return RunProcCommand(sub, sa); }
-    if (cmd == L"token")       { return CmdToken(sub, sa); }
-    if (cmd == L"mitigations") { return CmdMitigations(sub, sa); }
     if (cmd == L"callbacks") { return CmdCallbacks(sub, sa); }
     if (cmd == L"kdrivers")  { return CmdKdrivers(); }
     if (cmd == L"ssdt")      { return CmdSsdt(); }

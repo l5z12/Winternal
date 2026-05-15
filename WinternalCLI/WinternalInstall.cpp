@@ -642,7 +642,7 @@ int CmdSelfProtect(int argc, wchar_t** argv) {
         wprintf(L"  * CLI:    per-process OpenProcess filtering is NOT applied — this CLI is\n");
         wprintf(L"            one-shot and would only briefly cover itself anyway. For an\n");
         wprintf(L"            interactive session you want filtered, run:\n");
-        wprintf(L"              winternal protect <pid> --force\n");
+        wprintf(L"              winternal proc lock <pid> --force\n");
         wprintf(L"            from inside (or before) that session.\n");
         wprintf(L"To disengage: `winternal selfprotect off` from the same Winternal.exe. If you\n");
         wprintf(L"forget and the service becomes unreachable: `winternal recover` + reboot.\n");
