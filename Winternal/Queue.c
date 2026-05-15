@@ -1315,6 +1315,14 @@ static NTSTATUS WinternalProtectWriteCode(PVOID Target, const VOID* Src, SIZE_T 
     NTSTATUS m = WinternalProtectWriteCodeMdl(Target, Src, Length);
     DLOG("ProtectWriteCode: Mdl path  target=%p len=%llu -> 0x%08X",
          Target, (ULONGLONG)Length, m);
+    // Surface both sub-statuses unconditionally so callers diagnosing
+    // hook-install failures don't need to enable DLOG -- if either
+    // failure status looks unusual it gets logged at ERROR level.
+    if (!NT_SUCCESS(m)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] ProtectWriteCode target=%p Cr0=0x%08X Mdl=0x%08X\n",
+                   Target, s, m);
+    }
     return NT_SUCCESS(m) ? m : s;
 }
 
@@ -1854,6 +1862,93 @@ static UINT32     g_ProcRuleNextId  = 1;
 static KSPIN_LOCK g_ProcRuleSpin;
 static BOOLEAN    g_ProcRuleSpinInit = FALSE;
 
+// Driver-load block rules. Same shape as PROC_RULE but matched against
+// the service-name leaf NtLoadDriver receives. Definitions live here
+// (next to the other rule lists) so WinternalProcMonitorInit can
+// KeInitializeSpinLock without forward-declaring; handlers + the
+// NtLoadDriver inline hook are further down.
+typedef struct _WN_DRV_RULE_LIVE {
+    UINT32   RuleId;
+    UINT32   Action;
+    UINT32   MatchCount;
+    NTSTATUS Status;                                        // override for DENY (0 = ACCESS_DENIED)
+    WCHAR    Pattern[WINTERNAL_DRV_RULE_PATTERN_MAX];
+    USHORT   PatternLen;                                    // wchars excluding NUL
+} WN_DRV_RULE_LIVE;
+
+static WN_DRV_RULE_LIVE g_DrvRules[WINTERNAL_DRV_RULE_MAX_RULES];
+static ULONG      g_DrvRuleCount   = 0;
+static UINT32     g_DrvRuleNextId  = 1;
+static KSPIN_LOCK g_DrvRuleSpin;
+static BOOLEAN    g_DrvRuleSpinInit = FALSE;
+
+// Set TRUE by WinternalInstallNtLoadDriverHook on success. HandleDrvRuleAdd
+// refuses adds when neither this NOR the Cm-callback path is live (rules
+// would otherwise be stored but inert, leading to false-sense-of-security).
+static BOOLEAN g_NtLoadDrvHookInstalled;
+
+// Cm-callback enforcement: registered when the inline-hook path can't
+// install (HVCI / kernel-CI rejects the kernel-code write). The callback
+// catches RegNtPreOpenKey(Ex) on `\Registry\...\Services\<denied>` and
+// returns the per-rule NTSTATUS, making NtLoadDriver fail at its very
+// first registry op. No kernel-code modification, so it survives every
+// HVCI / WDAC configuration.
+static LARGE_INTEGER g_DrvRuleCmCookie;
+static BOOLEAN       g_DrvRuleCmRegistered;
+
+// Extract the service-name leaf from a registry path. NtLoadDriver gets
+// paths like "\Registry\Machine\System\CurrentControlSet\Services\Foo";
+// we want "Foo". Returns pointer + length into the input buffer (no copy).
+// Falls back to the full string if no `\` is found.
+static VOID WinternalDrvRuleLeafName(_In_ PCWSTR Buf, _In_ USHORT Len,
+                                     _Out_ PCWSTR* OutPtr, _Out_ USHORT* OutLen)
+{
+    USHORT last = 0;
+    BOOLEAN found = FALSE;
+    for (USHORT i = 0; i < Len; ++i) {
+        if (Buf[i] == L'\\') { last = (USHORT)(i + 1); found = TRUE; }
+    }
+    if (!found) { *OutPtr = Buf; *OutLen = Len; return; }
+    *OutPtr = Buf + last;
+    *OutLen = (USHORT)(Len - last);
+}
+
+// Evaluate drv rules against a service registry path. Returns the matching
+// action (WINTERNAL_DRV_ACT_*) and writes ruleId + per-rule NTSTATUS via
+// out-params. (UINT32)-1 = no match.
+static UINT32 WinternalDrvRuleEvaluate(_In_ PCUNICODE_STRING svcPath,
+                                       _Out_ UINT32* outRuleId,
+                                       _Out_ NTSTATUS* outStatus)
+{
+    *outRuleId = 0;
+    *outStatus = 0;
+    if (!g_DrvRuleSpinInit || g_DrvRuleCount == 0 || !svcPath || !svcPath->Buffer)
+        return (UINT32)-1;
+
+    PCWSTR leafBuf;
+    USHORT leafLen;
+    WinternalDrvRuleLeafName(svcPath->Buffer,
+                             (USHORT)(svcPath->Length / sizeof(WCHAR)),
+                             &leafBuf, &leafLen);
+    if (leafLen == 0) return (UINT32)-1;
+
+    UINT32 action = (UINT32)-1;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    for (ULONG i = 0; i < g_DrvRuleCount; ++i) {
+        if (WinternalMatchWildcard(g_DrvRules[i].Pattern, g_DrvRules[i].PatternLen,
+                                   leafBuf, leafLen)) {
+            g_DrvRules[i].MatchCount++;
+            action     = g_DrvRules[i].Action;
+            *outRuleId = g_DrvRules[i].RuleId;
+            *outStatus = g_DrvRules[i].Status;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+    return action;
+}
+
 // Evaluate proc rules against an image path. Returns the matching
 // action (WINTERNAL_PROC_ACT_*) and writes the rule ID + DENY status
 // override (zero when unset). (UINT32)-1 action = no match.
@@ -2244,6 +2339,23 @@ static VOID WinternalProcNotify(
 // further down, after the proc-monitor globals it relies on).
 static NTSTATUS WinternalInstallNtTermHook(VOID);
 static VOID     WinternalUninstallNtTermHook(VOID);
+// NtLoadDriver hook is symmetric -- installed best-effort at init,
+// torn down on driver unload. Drives `drv rule` enforcement. The *At
+// variant is what HOOK_INSTALL_BY_RVA dispatches to when the CLI has
+// PDB-resolved NtLoadDriver (Win11 IoT LTSC etc. don't export it).
+static NTSTATUS WinternalInstallNtLoadDriverHook(VOID);
+static NTSTATUS WinternalInstallNtLoadDriverHookAt(PVOID Target);
+static VOID     WinternalUninstallNtLoadDriverHook(VOID);
+// SSDT-walk resolver: reads SSN from a Zw stub's prologue, then derefs
+// KeServiceDescriptorTable[SSN]. Lets us find Nt* routines on builds
+// that strip their exports (Win11 IoT LTSC strips both NtTerminateProcess
+// AND NtLoadDriver). Definition is alongside the NtLoadDriver hook code.
+static PVOID    WinternalResolveByZwStub(PCWSTR ZwName);
+// Cm-callback enforcement for `drv rule`. Definitions live alongside the
+// NtLoadDriver hook code; the forward decls let WinternalProcMonitorInit /
+// Shutdown call them.
+static NTSTATUS WinternalRegisterDrvRuleCmCallback(VOID);
+static VOID     WinternalUnregisterDrvRuleCmCallback(VOID);
 // Same shape for the win32k NtUserDestroyWindow hook. HandleWinRuleAdd
 // installs it lazily on the first block-destroy rule; WinternalProc-
 // MonitorShutdown tears it down on driver unload.
@@ -2271,6 +2383,10 @@ NTSTATUS WinternalProcMonitorInit(VOID)
     if (!g_ProcRuleSpinInit) {
         KeInitializeSpinLock(&g_ProcRuleSpin);
         g_ProcRuleSpinInit = TRUE;
+    }
+    if (!g_DrvRuleSpinInit) {
+        KeInitializeSpinLock(&g_DrvRuleSpin);
+        g_DrvRuleSpinInit = TRUE;
     }
     if (!g_ProcProtectSpinInit) {
         KeInitializeSpinLock(&g_ProcProtectSpin);
@@ -2303,6 +2419,38 @@ NTSTATUS WinternalProcMonitorInit(VOID)
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[winternal] NtTerminateProcess hook install -> 0x%08X "
                    "(no TERMINATE_REQ attribution available)\n", hookStatus);
+    }
+    // Best-effort: install the NtLoadDriver prologue hook for `drv rule`
+    // enforcement. HVCI may reject the kernel-code write; if so, drv-rule
+    // ADD returns STATUS_DEVICE_NOT_READY and the CLI surfaces an
+    // INACTIVE state via the LIST_OUT.Flags hook-live bit.
+    NTSTATUS loadHookStatus;
+    __try {
+        loadHookStatus = WinternalInstallNtLoadDriverHook();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        loadHookStatus = (NTSTATUS)GetExceptionCode();
+    }
+    if (!NT_SUCCESS(loadHookStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] NtLoadDriver hook install -> 0x%08X "
+                   "(falling back to Cm-callback enforcement)\n", loadHookStatus);
+    }
+    // Always register the Cm-callback as well. On machines where the
+    // inline hook is live this gives defense-in-depth (the Cm callback
+    // catches the registry open first; if somehow bypassed the inline
+    // hook re-checks the rules). On machines where the inline hook
+    // can't install (HVCI / WDAC kernel CI), this is the only working
+    // enforcement layer.
+    NTSTATUS cmStatus;
+    __try {
+        cmStatus = WinternalRegisterDrvRuleCmCallback();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        cmStatus = (NTSTATUS)GetExceptionCode();
+    }
+    if (!NT_SUCCESS(cmStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] drv-rule Cm-callback register -> 0x%08X\n",
+                   cmStatus);
     }
     return STATUS_SUCCESS;
 }
@@ -2463,6 +2611,126 @@ static NTSTATUS HandleProcRuleClear(VOID)
     g_ProcRuleCount  = 0;
     g_ProcRuleNextId = 1;
     KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    return STATUS_SUCCESS;
+}
+
+// ---- drv rule add/remove/list/clear ----
+//
+// Driver-load block rules. Storage globals + evaluator are defined up
+// near the other rule lists (so WinternalProcMonitorInit can KeInit the
+// spinlock). Handlers + the NtLoadDriver hook live below.
+
+static NTSTATUS HandleDrvRuleAdd(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_DRV_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_DRV_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_DRV_RULE in = (PWINTERNAL_DRV_RULE)InBuf;
+
+    USHORT plen = 0;
+    while (plen < WINTERNAL_DRV_RULE_PATTERN_MAX && in->Pattern[plen]) ++plen;
+    if (plen == 0 || plen >= WINTERNAL_DRV_RULE_PATTERN_MAX) return STATUS_INVALID_PARAMETER;
+    if (in->Action > WINTERNAL_DRV_ACT_LOG) return STATUS_INVALID_PARAMETER;
+    // Need at least one enforcement layer live -- otherwise rules
+    // are stored but inert, which silently gives users a false sense
+    // of security.
+    if (!g_NtLoadDrvHookInstalled && !g_DrvRuleCmRegistered)
+        return STATUS_DEVICE_NOT_READY;
+    if (!g_DrvRuleSpinInit) return STATUS_DEVICE_NOT_READY;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    if (g_DrvRuleCount >= WINTERNAL_DRV_RULE_MAX_RULES) {
+        KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    WN_DRV_RULE_LIVE* r = &g_DrvRules[g_DrvRuleCount];
+    r->RuleId     = g_DrvRuleNextId++;
+    r->Action     = in->Action;
+    r->MatchCount = 0;
+    r->Status     = (NTSTATUS)in->Status;
+    RtlCopyMemory(r->Pattern, in->Pattern, plen * sizeof(WCHAR));
+    r->Pattern[plen] = 0;
+    r->PatternLen = plen;
+    UINT32 assignedId = r->RuleId;
+    ++g_DrvRuleCount;
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+
+    PWINTERNAL_DRV_RULE out = (PWINTERNAL_DRV_RULE)OutBuf;
+    RtlCopyMemory(out, in, sizeof(*out));
+    out->RuleId = assignedId;
+    out->Flags  = 0;
+    if (g_NtLoadDrvHookInstalled) out->Flags |= WINTERNAL_DRV_RULE_FLAG_HOOK_LIVE;
+    if (g_DrvRuleCmRegistered)    out->Flags |= WINTERNAL_DRV_RULE_FLAG_CM_LIVE;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleDrvRuleRemove(PVOID InBuf, size_t InLen)
+{
+    if (InLen < sizeof(WINTERNAL_DRV_RULE_REMOVE_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_DRV_RULE_REMOVE_IN in = (PWINTERNAL_DRV_RULE_REMOVE_IN)InBuf;
+    if (!g_DrvRuleSpinInit) return STATUS_NOT_FOUND;
+
+    KIRQL irql;
+    BOOLEAN removed = FALSE;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    for (ULONG i = 0; i < g_DrvRuleCount; ++i) {
+        if (g_DrvRules[i].RuleId == in->RuleId) {
+            for (ULONG j = i; j + 1 < g_DrvRuleCount; ++j) g_DrvRules[j] = g_DrvRules[j + 1];
+            --g_DrvRuleCount;
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+    return removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static NTSTATUS HandleDrvRuleList(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_DRV_RULE_LIST_OUT, Rules);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_DRV_RULE_LIST_OUT out = (PWINTERNAL_DRV_RULE_LIST_OUT)OutBuf;
+    ULONG maxRules = (ULONG)((OutLen - header) / sizeof(WINTERNAL_DRV_RULE));
+
+    out->Flags = 0;
+    if (g_NtLoadDrvHookInstalled) out->Flags |= WINTERNAL_DRV_RULE_FLAG_HOOK_LIVE;
+    if (g_DrvRuleCmRegistered)    out->Flags |= WINTERNAL_DRV_RULE_FLAG_CM_LIVE;
+
+    if (!g_DrvRuleSpinInit) {
+        out->Count = 0;
+        *Written = header;
+        return STATUS_SUCCESS;
+    }
+    KIRQL irql;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    ULONG toReturn = g_DrvRuleCount < maxRules ? g_DrvRuleCount : maxRules;
+    for (ULONG i = 0; i < toReturn; ++i) {
+        out->Rules[i].RuleId     = g_DrvRules[i].RuleId;
+        out->Rules[i].Action     = g_DrvRules[i].Action;
+        out->Rules[i].MatchCount = g_DrvRules[i].MatchCount;
+        out->Rules[i].Status     = (UINT32)g_DrvRules[i].Status;
+        out->Rules[i].Flags      = out->Flags;          // mirror hook-live bit
+        out->Rules[i].Reserved   = 0;
+        RtlCopyMemory(out->Rules[i].Pattern, g_DrvRules[i].Pattern,
+                      (g_DrvRules[i].PatternLen + 1) * sizeof(WCHAR));
+    }
+    out->Count = toReturn;
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+
+    *Written = header + toReturn * sizeof(WINTERNAL_DRV_RULE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleDrvRuleClear(VOID)
+{
+    if (!g_DrvRuleSpinInit) return STATUS_SUCCESS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    RtlZeroMemory(g_DrvRules, sizeof(g_DrvRules));
+    g_DrvRuleCount  = 0;
+    g_DrvRuleNextId = 1;
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
     return STATUS_SUCCESS;
 }
 
@@ -2840,9 +3108,13 @@ VOID WinternalProcMonitorShutdown(VOID)
     // Called from the driver-unload path to make sure the kernel
     // doesn't keep a dangling pointer to our notify routine OR to the
     // NtTerminateProcess detour (jmp into freed pool = guaranteed BSOD).
-    // Same applies to the NtUserDestroyWindow hook -- pull both before
-    // we let any other teardown free pool that might back the trampolines.
+    // Same applies to the NtUserDestroyWindow and NtLoadDriver hooks --
+    // pull all three before we let any other teardown free pool that
+    // might back the trampolines. Also unregister the Cm callback --
+    // the Cm engine would dispatch into freed code if we don't.
     WinternalUninstallNtTermHook();
+    WinternalUninstallNtLoadDriverHook();
+    WinternalUnregisterDrvRuleCmCallback();
     WinternalUninstallDestroyWindowHook();
     InterlockedExchange(&g_ProcMonActive, 0);
     if (InterlockedCompareExchange(&g_ProcNotifyReg, 0, 1) == 1) {
@@ -2853,6 +3125,12 @@ VOID WinternalProcMonitorShutdown(VOID)
         KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
         g_ProcRuleCount = 0;
         KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    }
+    if (g_DrvRuleSpinInit) {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+        g_DrvRuleCount = 0;
+        KeReleaseSpinLock(&g_DrvRuleSpin, irql);
     }
     if (g_ProcProtectSpinInit) {
         KIRQL irql;
@@ -2978,9 +3256,15 @@ static NTSTATUS NTAPI WinternalNtTerminateProcess_Detour(_In_opt_ HANDLE Process
 static NTSTATUS WinternalInstallNtTermHook(VOID)
 {
     if (g_NtTermHookInstalled) return STATUS_SUCCESS;
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, L"NtTerminateProcess");
-    PVOID target = MmGetSystemRoutineAddress(&name);
+    // Same export-stripping situation as NtLoadDriver on Win11 IoT LTSC:
+    // the Nt* symbol may not resolve. Prefer SSDT walk via the Zw stub,
+    // fall back to the export name for builds that still ship it.
+    PVOID target = WinternalResolveByZwStub(L"ZwTerminateProcess");
+    if (!target) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"NtTerminateProcess");
+        target = MmGetSystemRoutineAddress(&name);
+    }
     if (!target) return STATUS_PROCEDURE_NOT_FOUND;
 
     PUCHAR tramp = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE,
@@ -3033,6 +3317,406 @@ static VOID WinternalUninstallNtTermHook(VOID)
     g_NtTermOriginal      = NULL;
     g_NtTermPrologSize    = 0;
     g_NtTermHookInstalled = FALSE;
+}
+
+// -----------------------------------------------------------------------------
+// NtLoadDriver prologue hook — driver-side enforcement of `drv rule`.
+//
+// NtLoadDriver(IN PUNICODE_STRING DriverServiceName) is the single syscall
+// every load path funnels through: SCM-driven `sc start`, direct
+// ZwLoadDriver from our own `drv load`, third-party loaders, etc. Hooking
+// it covers them all uniformly. The detour pulls the service-name leaf
+// from the registry path, evaluates the rule list, and returns the
+// rule's NTSTATUS without calling the original on DENY. On ALLOW / LOG /
+// no-match it tail-calls the saved prolog trampoline as if no hook were
+// installed.
+//
+// HVCI caveat is the same as the NtTerminateProcess hook — the CR0.WP-
+// protected kernel-code write may be rejected. WinternalProcMonitorInit
+// reports the install status; HandleDrvRuleAdd refuses adds when the
+// hook isn't live so users don't think they're protected when nothing
+// is enforcing.
+// -----------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *PFN_NT_LOAD_DRIVER)(_In_ PUNICODE_STRING DriverServiceName);
+static PVOID  g_NtLoadDrvTarget       = NULL;
+static PUCHAR g_NtLoadDrvTrampoline   = NULL;
+static PFN_NT_LOAD_DRIVER g_NtLoadDrvOriginal = NULL;
+static UCHAR  g_NtLoadDrvSavedProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+static ULONG  g_NtLoadDrvPrologSize   = 0;
+// g_NtLoadDrvHookInstalled is forward-declared up next to g_DrvRules so
+// HandleDrvRuleAdd can read it. Definition lives here as the canonical
+// home alongside the other hook bookkeeping. BSS-zeroes to FALSE.
+
+static NTSTATUS NTAPI WinternalNtLoadDriver_Detour(_In_ PUNICODE_STRING DriverServiceName)
+{
+    // NtLoadDriver is called from user mode (services.exe, sc.exe) AND
+    // from kernel mode (our own HandleKdrvLoad). For user-mode callers
+    // we need to probe the UNICODE_STRING before reading it, otherwise
+    // a bad pointer would BSOD. ProbeForRead raises on a bad address;
+    // wrap the whole evaluation in __try.
+    UNICODE_STRING local = {0};
+    BOOLEAN haveLocal = FALSE;
+    KPROCESSOR_MODE prevMode = ExGetPreviousMode();
+    __try {
+        if (prevMode != KernelMode) {
+            ProbeForRead(DriverServiceName, sizeof(UNICODE_STRING), sizeof(USHORT));
+            local = *DriverServiceName;
+            if (local.Buffer && local.Length) {
+                ProbeForRead(local.Buffer, local.Length, sizeof(WCHAR));
+            }
+        } else {
+            local = *DriverServiceName;
+        }
+        haveLocal = TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        haveLocal = FALSE;
+    }
+
+    if (haveLocal && local.Buffer && local.Length) {
+        UINT32 ruleId = 0;
+        NTSTATUS ruleStatus = 0;
+        UINT32 act = WinternalDrvRuleEvaluate(&local, &ruleId, &ruleStatus);
+        if (act == WINTERNAL_DRV_ACT_DENY) {
+            NTSTATUS deny = NT_SUCCESS(ruleStatus) ? STATUS_ACCESS_DENIED : ruleStatus;
+            AuditAppend(IOCTL_WINTERNAL_DRV_RULE_ADD,
+                        (UINT64)(ULONG_PTR)local.Buffer, ruleId, deny);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] drv rule %u DENIED %wZ\n", ruleId, &local);
+            return deny;
+        }
+        if (act == WINTERNAL_DRV_ACT_LOG) {
+            AuditAppend(IOCTL_WINTERNAL_DRV_RULE_ADD,
+                        (UINT64)(ULONG_PTR)local.Buffer, ruleId, STATUS_SUCCESS);
+        }
+    }
+
+    return g_NtLoadDrvOriginal ? g_NtLoadDrvOriginal(DriverServiceName)
+                               : STATUS_NOT_IMPLEMENTED;
+}
+
+// Install at a caller-provided VA. Pulled out as a helper so both the
+// at-init export-resolve path AND the RVA-based path (PDB-resolved on
+// the CLI, dispatched through IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA) can
+// share the same patch logic.
+static NTSTATUS WinternalInstallNtLoadDriverHookAt(PVOID target)
+{
+    if (g_NtLoadDrvHookInstalled) return STATUS_SUCCESS;
+    if (!target) return STATUS_INVALID_PARAMETER;
+
+    PUCHAR tramp = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE,
+                                           WINTERNAL_KHOOK_TRAMP_SIZE,
+                                           WINTERNAL_POOL_TAG_DEFAULT);
+    if (!tramp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    ULONG prolog = WINTERNAL_KHOOK_JMP_SIZE;
+    UCHAR newProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+    NTSTATUS status;
+    __try {
+        RtlCopyMemory(g_NtLoadDrvSavedProlog, target, prolog);
+        RtlCopyMemory(tramp, target, prolog);
+        KhookWriteJmpAbs(tramp + prolog, (PUCHAR)target + prolog);
+        KhookWriteJmpAbs(newProlog, (PVOID)(ULONG_PTR)WinternalNtLoadDriver_Detour);
+        status = STATUS_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+    __try {
+        status = WinternalProtectWriteCode(target, newProlog, prolog);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+    g_NtLoadDrvTarget        = target;
+    g_NtLoadDrvTrampoline    = tramp;
+    g_NtLoadDrvOriginal      = (PFN_NT_LOAD_DRIVER)tramp;
+    g_NtLoadDrvPrologSize    = prolog;
+    g_NtLoadDrvHookInstalled = TRUE;
+    return STATUS_SUCCESS;
+}
+
+// Resolve the SSN embedded in a Zw stub's prologue. Win11 IoT LTSC (and
+// some hardened SKUs) strip the Nt* exports from ntoskrnl, but the Zw
+// stubs remain exported -- and on x64 they all share the same shape:
+//
+//   48 8B C4                  mov rax, rsp
+//   FA                        cli
+//   48 83 EC 10               sub rsp, 10h
+//   50                        push rax
+//   9C                        pushfq
+//   6A 10                     push 10h
+//   48 8D 05 .. .. .. ..      lea rax, KiServiceLinkage
+//   50                        push rax
+//   B8 .. .. .. ..            mov eax, SSN      <-- what we extract
+//   E9 .. .. .. ..            jmp KiServiceInternal
+//
+// The `B8 IMM32` is at a stable offset (0x17 on current builds) but we
+// scan for it within the first 0x20 bytes to be build-agnostic. We also
+// require the next byte to be `E9` (jmp) so a stray `B8` elsewhere in
+// the stub can't fool us -- the SSN-mov immediately precedes the jmp.
+// Returns (ULONG)-1 if extraction fails.
+static ULONG WinternalReadZwStubSsn(_In_ PUCHAR zw)
+{
+    if (!zw) return (ULONG)-1;
+    ULONG ssn = (ULONG)-1;
+    __try {
+        for (ULONG i = 0; i < 0x20; ++i) {
+            if (zw[i] == 0xB8 && zw[i + 5] == 0xE9) {
+                ssn = *(ULONG*)&zw[i + 1];
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (ULONG)-1;
+    }
+    return ssn;
+}
+
+// Given an SSN, return the address of the Nt routine via SSDT lookup.
+// x64 encoding: routine = (LONG)(entry >> 4) + (ULONG_PTR)Base. Uses the
+// existing LocateServiceDescriptor() that powers `enum_ssdt`.
+static PVOID WinternalResolveByZwStub(_In_ PCWSTR zwName)
+{
+    UNICODE_STRING us;
+    RtlInitUnicodeString(&us, zwName);
+    PUCHAR zw = (PUCHAR)MmGetSystemRoutineAddress(&us);
+    if (!zw) return NULL;
+
+    ULONG ssn = WinternalReadZwStubSsn(zw);
+    if (ssn == (ULONG)-1) return NULL;
+
+    KSERVICE_TABLE_DESCRIPTOR* desc = LocateServiceDescriptor();
+    if (!desc || !desc->Base) return NULL;
+    if (ssn >= desc->Limit) return NULL;
+
+    LONG offset = (LONG)(desc->Base[ssn] >> 4);
+    return (PUCHAR)desc->Base + offset;
+}
+
+static NTSTATUS WinternalInstallNtLoadDriverHook(VOID)
+{
+    if (g_NtLoadDrvHookInstalled) return STATUS_SUCCESS;
+    // Prefer SSDT resolution -- works on every build including ones that
+    // strip the `NtLoadDriver` export. Fall back to MmGetSystemRoutineAddress
+    // for the (rare) machines where SSDT location fails but the symbol
+    // is exported.
+    PVOID target = WinternalResolveByZwStub(L"ZwLoadDriver");
+    if (!target) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"NtLoadDriver");
+        target = MmGetSystemRoutineAddress(&name);
+    }
+    if (!target) return STATUS_PROCEDURE_NOT_FOUND;
+    return WinternalInstallNtLoadDriverHookAt(target);
+}
+
+// -----------------------------------------------------------------------------
+// Cm-callback enforcement for `drv rule deny`.
+//
+// Why we need this: machines with HVCI / Win11 IoT-LTSC kernel CI refuse
+// kernel-code writes outright (CR0.WP toggle traps as PRIVILEGED_INSTRUCTION,
+// MmProbeAndLockPages for IoModifyAccess on .text raises ACCESS_VIOLATION).
+// The inline-hook approach therefore can't install. Cm callbacks are a
+// documented kernel feature with no code-modification requirement, so this
+// path works under every HVCI / WDAC kernel-CI configuration.
+//
+// Tradeoff vs the inline hook: this fires for EVERY registry op (not just
+// driver loads), and it blocks ALL opens of a denied service's registry
+// key -- not just the one NtLoadDriver makes. So `sc query <denied>` and
+// `reg query` on the same key also fail. That's documented in the rule's
+// help text and surfaced in `drv rule list` as `cm-callback` enforcement.
+// -----------------------------------------------------------------------------
+
+#define WINTERNAL_DRV_SVC_PREFIX        L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\"
+#define WINTERNAL_DRV_SVC_PREFIX_CHARS  ((sizeof(WINTERNAL_DRV_SVC_PREFIX) / sizeof(WCHAR)) - 1)
+
+// Given a full registry path the callback received (e.g.
+// "\Registry\Machine\System\CurrentControlSet\Services\Foo\Parameters"),
+// return a pointer + length to the service-name leaf ("Foo"). Returns
+// FALSE when the path isn't under \Services\ at all.
+static BOOLEAN WinternalCmExtractServiceLeaf(_In_ PCUNICODE_STRING name,
+                                             _Out_ PCWSTR* outLeaf,
+                                             _Out_ USHORT* outLen)
+{
+    *outLeaf = NULL;
+    *outLen  = 0;
+    if (!name || !name->Buffer) return FALSE;
+
+    USHORT pathChars = (USHORT)(name->Length / sizeof(WCHAR));
+    if (pathChars <= WINTERNAL_DRV_SVC_PREFIX_CHARS) return FALSE;
+
+    // Case-insensitive prefix match. RtlPrefixUnicodeString would also
+    // work but builds a UNICODE_STRING for the constant which is overkill.
+    for (USHORT i = 0; i < WINTERNAL_DRV_SVC_PREFIX_CHARS; ++i) {
+        WCHAR p = WINTERNAL_DRV_SVC_PREFIX[i];
+        WCHAR n = name->Buffer[i];
+        if (p >= L'A' && p <= L'Z') p = (WCHAR)(p + 32);
+        if (n >= L'A' && n <= L'Z') n = (WCHAR)(n + 32);
+        if (p != n) return FALSE;
+    }
+
+    PCWSTR leaf    = name->Buffer + WINTERNAL_DRV_SVC_PREFIX_CHARS;
+    USHORT leafMax = (USHORT)(pathChars - WINTERNAL_DRV_SVC_PREFIX_CHARS);
+    USHORT leafLen = leafMax;
+    // Stop at the first `\` so we get just the service-name component --
+    // e.g. for `\Services\Foo\Parameters` we want `Foo`.
+    for (USHORT i = 0; i < leafMax; ++i) {
+        if (leaf[i] == L'\\') { leafLen = i; break; }
+    }
+    if (leafLen == 0) return FALSE;
+    *outLeaf = leaf;
+    *outLen  = leafLen;
+    return TRUE;
+}
+
+// Run the rule list against a service-name leaf. Same semantics as
+// WinternalDrvRuleEvaluate but takes a raw leaf instead of a UNICODE_STRING
+// so the Cm callback can skip the path-parsing step inside the spinlock.
+static UINT32 WinternalDrvRuleEvaluateLeaf(_In_ PCWSTR leaf, _In_ USHORT leafLen,
+                                           _Out_ UINT32* outRuleId,
+                                           _Out_ NTSTATUS* outStatus)
+{
+    *outRuleId = 0;
+    *outStatus = 0;
+    if (!g_DrvRuleSpinInit || g_DrvRuleCount == 0 || leafLen == 0)
+        return (UINT32)-1;
+
+    UINT32 action = (UINT32)-1;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_DrvRuleSpin, &irql);
+    for (ULONG i = 0; i < g_DrvRuleCount; ++i) {
+        if (WinternalMatchWildcard(g_DrvRules[i].Pattern, g_DrvRules[i].PatternLen,
+                                   leaf, leafLen)) {
+            g_DrvRules[i].MatchCount++;
+            action     = g_DrvRules[i].Action;
+            *outRuleId = g_DrvRules[i].RuleId;
+            *outStatus = g_DrvRules[i].Status;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_DrvRuleSpin, irql);
+    return action;
+}
+
+// REG_NOTIFY_CLASS values we care about. Kept as plain enums so we don't
+// pull in <wdm.h>-only headers (CmRegisterCallback ships from ntddk).
+// Pre-XP-SP2 callers also use RegNtPreOpenKey; modern ones use the Ex
+// variant with the full access-info struct. We handle both.
+typedef struct _WN_REG_PRE_OPEN_KEY_EX {
+    PUNICODE_STRING CompleteName;
+    PVOID           RootObject;
+    PVOID           ObjectType;
+    ULONG           Options;
+    PUNICODE_STRING Class;
+    PVOID           SecurityDescriptor;
+    PVOID           SecurityQualityOfService;
+    ACCESS_MASK     DesiredAccess;
+    ACCESS_MASK     GrantedAccess;
+    PNTSTATUS       Disposition;
+    PVOID*          ResultObject;
+    PVOID           CallContext;
+    PVOID           RootObjectContext;
+    PVOID           Transaction;
+    PVOID           Reserved;
+} WN_REG_PRE_OPEN_KEY_EX, *PWN_REG_PRE_OPEN_KEY_EX;
+
+typedef struct _WN_REG_PRE_OPEN_KEY {
+    PUNICODE_STRING CompleteName;
+} WN_REG_PRE_OPEN_KEY, *PWN_REG_PRE_OPEN_KEY;
+
+NTKERNELAPI NTSTATUS CmRegisterCallbackEx(
+    _In_     PEX_CALLBACK_FUNCTION  Function,
+    _In_     PCUNICODE_STRING       Altitude,
+    _In_     PVOID                  Driver,
+    _In_opt_ PVOID                  Context,
+    _Out_    PLARGE_INTEGER         Cookie,
+    _Reserved_ PVOID                Reserved);
+
+NTKERNELAPI NTSTATUS CmUnRegisterCallback(_In_ LARGE_INTEGER Cookie);
+
+#define WN_REG_NT_PRE_OPEN_KEY      22u    // REG_NOTIFY_CLASS::RegNtPreOpenKey
+#define WN_REG_NT_PRE_OPEN_KEY_EX   29u    // ::RegNtPreOpenKeyEx
+
+static NTSTATUS WinternalCmRegistryCallback(_In_ PVOID Context,
+                                            _In_ PVOID Argument1,
+                                            _In_ PVOID Argument2)
+{
+    UNREFERENCED_PARAMETER(Context);
+    ULONG op = (ULONG)(ULONG_PTR)Argument1;
+    if (op != WN_REG_NT_PRE_OPEN_KEY && op != WN_REG_NT_PRE_OPEN_KEY_EX)
+        return STATUS_SUCCESS;
+    if (!Argument2) return STATUS_SUCCESS;
+
+    PUNICODE_STRING completeName = NULL;
+    if (op == WN_REG_NT_PRE_OPEN_KEY_EX) {
+        completeName = ((PWN_REG_PRE_OPEN_KEY_EX)Argument2)->CompleteName;
+    } else {
+        completeName = ((PWN_REG_PRE_OPEN_KEY)Argument2)->CompleteName;
+    }
+    if (!completeName) return STATUS_SUCCESS;
+
+    PCWSTR leaf = NULL;
+    USHORT leafLen = 0;
+    if (!WinternalCmExtractServiceLeaf(completeName, &leaf, &leafLen))
+        return STATUS_SUCCESS;
+
+    UINT32   ruleId = 0;
+    NTSTATUS override = 0;
+    UINT32 action = WinternalDrvRuleEvaluateLeaf(leaf, leafLen, &ruleId, &override);
+    if (action == WINTERNAL_DRV_ACT_DENY) {
+        NTSTATUS deny = NT_SUCCESS(override) ? STATUS_ACCESS_DENIED : override;
+        AuditAppend(IOCTL_WINTERNAL_DRV_RULE_ADD,
+                    (UINT64)(ULONG_PTR)completeName->Buffer, ruleId, deny);
+        return deny;
+    }
+    if (action == WINTERNAL_DRV_ACT_LOG) {
+        AuditAppend(IOCTL_WINTERNAL_DRV_RULE_ADD,
+                    (UINT64)(ULONG_PTR)completeName->Buffer, ruleId, STATUS_SUCCESS);
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS WinternalRegisterDrvRuleCmCallback(VOID)
+{
+    if (g_DrvRuleCmRegistered) return STATUS_SUCCESS;
+    UNICODE_STRING altitude;
+    // High enough to run before most filesystem / 3rd-party callbacks but
+    // not so high we collide with critical security products. Microsoft's
+    // altitude registry doesn't gate non-WHQL drivers; this string just
+    // has to be unique across active callbacks on the system.
+    RtlInitUnicodeString(&altitude, L"385000.42");
+    NTSTATUS s = CmRegisterCallbackEx(WinternalCmRegistryCallback, &altitude,
+                                      (PVOID)WinternalCmRegistryCallback,
+                                      NULL, &g_DrvRuleCmCookie, NULL);
+    if (NT_SUCCESS(s)) g_DrvRuleCmRegistered = TRUE;
+    return s;
+}
+
+static VOID WinternalUnregisterDrvRuleCmCallback(VOID)
+{
+    if (!g_DrvRuleCmRegistered) return;
+    (void)CmUnRegisterCallback(g_DrvRuleCmCookie);
+    g_DrvRuleCmRegistered = FALSE;
+}
+
+static VOID WinternalUninstallNtLoadDriverHook(VOID)
+{
+    if (!g_NtLoadDrvHookInstalled) return;
+    (void)WinternalProtectWriteCode(g_NtLoadDrvTarget, g_NtLoadDrvSavedProlog, g_NtLoadDrvPrologSize);
+    if (g_NtLoadDrvTrampoline) {
+        ExFreePoolWithTag(g_NtLoadDrvTrampoline, WINTERNAL_POOL_TAG_DEFAULT);
+        g_NtLoadDrvTrampoline = NULL;
+    }
+    g_NtLoadDrvTarget        = NULL;
+    g_NtLoadDrvOriginal      = NULL;
+    g_NtLoadDrvPrologSize    = 0;
+    g_NtLoadDrvHookInstalled = FALSE;
 }
 
 // -----------------------------------------------------------------------------
@@ -3774,6 +4458,8 @@ static NTSTATUS WinternalInstallHookByRva(
     switch (HookId) {
         case WINTERNAL_HOOK_ID_DESTROY_WINDOW:
             return WinternalInstallDestroyWindowHookAt(TargetVa);
+        case WINTERNAL_HOOK_ID_NT_LOAD_DRIVER:
+            return WinternalInstallNtLoadDriverHookAt(TargetVa);
         default:
             return STATUS_NOT_IMPLEMENTED;
     }
@@ -4987,6 +5673,10 @@ static NTSTATUS HandleProcRuleAdd(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleProcRuleRemove(PVOID, size_t);
 static NTSTATUS HandleProcRuleList(PVOID, size_t, size_t*);
 static NTSTATUS HandleProcRuleClear(VOID);
+static NTSTATUS HandleDrvRuleAdd(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleDrvRuleRemove(PVOID, size_t);
+static NTSTATUS HandleDrvRuleList(PVOID, size_t, size_t*);
+static NTSTATUS HandleDrvRuleClear(VOID);
 static NTSTATUS HandleProcProtectAdd(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleProcProtectRemove(PVOID, size_t);
 static NTSTATUS HandleProcProtectList(PVOID, size_t, size_t*);
@@ -6706,6 +7396,18 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
         break;
     case IOCTL_WINTERNAL_PROC_RULE_CLEAR:
         status = HandleProcRuleClear();
+        break;
+    case IOCTL_WINTERNAL_DRV_RULE_ADD:
+        status = HandleDrvRuleAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_DRV_RULE_REMOVE:
+        status = HandleDrvRuleRemove(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_DRV_RULE_LIST:
+        status = HandleDrvRuleList(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_DRV_RULE_CLEAR:
+        status = HandleDrvRuleClear();
         break;
     case IOCTL_WINTERNAL_PROC_PROTECT_ADD:
         status = HandleProcProtectAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);

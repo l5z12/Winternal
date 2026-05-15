@@ -673,6 +673,7 @@ typedef struct _WINTERNAL_WIN_RULE_LIST_OUT {
 // HookId selects which detour to bind. New entries here MUST match the
 // dispatch table in Queue.c (g_HookDispatch).
 #define WINTERNAL_HOOK_ID_DESTROY_WINDOW   1u
+#define WINTERNAL_HOOK_ID_NT_LOAD_DRIVER   2u
 
 typedef struct _WINTERNAL_HOOK_RVA_REQ {
     WCHAR  Module[64];      // file name only (e.g. "win32kfull.sys"); case-insensitive
@@ -715,6 +716,77 @@ typedef struct _WINTERNAL_PROC_RULE_LIST_OUT {
     UINT32 Reserved;
     WINTERNAL_PROC_RULE Rules[1];                           // [Count]
 } WINTERNAL_PROC_RULE_LIST_OUT, *PWINTERNAL_PROC_RULE_LIST_OUT;
+
+// ---- Driver-load block rules ----
+//
+// Symmetric to PROC_RULE but for kernel drivers. The driver inline-hooks
+// NtLoadDriver(IN PUNICODE_STRING DriverServiceName); the detour parses
+// the service-name component (the leaf of
+// "\Registry\Machine\System\CurrentControlSet\Services\<name>"), walks
+// the rule list, and returns the rule's NTSTATUS on DENY without calling
+// the original. Patterns are case-insensitive wildcards (same matcher as
+// PROC_RULE) matched against the service-name leaf — e.g. `Foo`, `Foo*`,
+// `*`. SCM-driven loads (services.exe -> NtLoadDriver) and direct
+// ZwLoadDriver callers (our own `drv load`, third-party tools) are both
+// caught since both go through the same syscall.
+//
+// Actions on match:
+//   ALLOW (default if no rule) — pass through.
+//   DENY                       — skip the original, return per-rule
+//                                NTSTATUS to the caller (default
+//                                STATUS_ACCESS_DENIED).
+//   LOG                        — audit only; load proceeds.
+//
+// HVCI: same caveat as the NtTerminateProcess hook — the CR0.WP-protected
+// kernel-code write may be rejected, in which case ADD returns
+// STATUS_DEVICE_NOT_READY and no rules are enforceable. Status surfaced
+// to the CLI via the LIST_OUT.HookLive flag.
+#define IOCTL_WINTERNAL_DRV_RULE_ADD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_DRV_RULE_REMOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_DRV_RULE_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_DRV_RULE_CLEAR  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B8, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_DRV_RULE_MAX_RULES    64
+#define WINTERNAL_DRV_RULE_PATTERN_MAX  128
+
+#define WINTERNAL_DRV_ACT_ALLOW 0
+#define WINTERNAL_DRV_ACT_DENY  1
+#define WINTERNAL_DRV_ACT_LOG   2
+
+// Bits set on the first list entry's Flags telling the CLI which
+// enforcement layer(s) are actually live. The driver attempts both at
+// init; either alone is sufficient to enforce rules. HOOK_LIVE is the
+// inline patch on NtLoadDriver -- precise (only blocks driver loads,
+// not other registry tools) but rejected on HVCI / kernel-CI machines.
+// CM_LIVE is the CmRegisterCallbackEx fallback -- works under any
+// kernel-CI configuration but also blocks unrelated registry opens on
+// the same `\Services\<denied>` key (sc query, reg query, etc.).
+#define WINTERNAL_DRV_RULE_FLAG_HOOK_LIVE 0x00000001u
+#define WINTERNAL_DRV_RULE_FLAG_CM_LIVE   0x00000002u
+
+typedef struct _WINTERNAL_DRV_RULE {
+    UINT32 RuleId;                                          // 0 on ADD; assigned by driver
+    UINT32 Action;                                          // WINTERNAL_DRV_ACT_*
+    UINT32 MatchCount;                                      // populated on LIST
+    UINT32 Status;                                          // NTSTATUS returned to NtLoadDriver
+                                                            //   on DENY. 0 -> default
+                                                            //   STATUS_ACCESS_DENIED.
+    UINT32 Flags;                                           // populated on LIST; first entry
+                                                            //   carries hook-live bit.
+    UINT32 Reserved;
+    WCHAR  Pattern[WINTERNAL_DRV_RULE_PATTERN_MAX];         // wildcard against service name
+} WINTERNAL_DRV_RULE, *PWINTERNAL_DRV_RULE;
+
+typedef struct _WINTERNAL_DRV_RULE_REMOVE_IN {
+    UINT32 RuleId;
+    UINT32 Reserved;
+} WINTERNAL_DRV_RULE_REMOVE_IN, *PWINTERNAL_DRV_RULE_REMOVE_IN;
+
+typedef struct _WINTERNAL_DRV_RULE_LIST_OUT {
+    UINT32 Count;
+    UINT32 Flags;                                           // WINTERNAL_DRV_RULE_FLAG_*
+    WINTERNAL_DRV_RULE Rules[1];                            // [Count]
+} WINTERNAL_DRV_RULE_LIST_OUT, *PWINTERNAL_DRV_RULE_LIST_OUT;
 
 // ---- NTFS filter (NtCreateFile hook + rule list) ----
 //

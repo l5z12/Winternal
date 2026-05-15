@@ -207,6 +207,8 @@ void PrintHelp() {
     app.subcommand(under(L"drv-enable", L"drv enable | disable <name>",  L"set StartType", H_DMGT));
     app.subcommand(under(L"drv-delete", L"drv delete <name>",            L"DeleteService", H_DMGT));
     app.subcommand(under(L"drv-unload", L"drv unload <name>",            L"force unload via Winternal.sys", H_DMGT));
+    app.subcommand(under(L"drv-rule",   L"drv rule add <pat> <allow|deny|log> [--status N]",
+                                        L"prohibit kernel-driver loads by name pattern", H_DMGT));
 
     // Trailing meta — back in the default group.
     app.subcommand(cmd(L"help",        L"help",                          L"show this help"));
@@ -3520,6 +3522,7 @@ static const KnownSymbol kKnownSymbols[] = {
     { L"win32kfull.sys", "NtUserDestroyWindow",  L"win rule block-destroy hook" },
     { L"win32kfull.sys", "NtUserCreateWindowEx", L"future win rule block-create hook" },
     { L"win32kfull.sys", "xxxDestroyWindow",     L"internal worker (non-exported)" },
+    { L"ntoskrnl.exe",   "NtLoadDriver",         L"drv rule deny hook" },
     // ntoskrnl's public PDB strips most `Psp*` private symbols, so don't
     // bother prefetching them -- they'll always miss. Add ntoskrnl entries
     // here only for symbols that show up in the public/global table.

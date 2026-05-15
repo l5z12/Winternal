@@ -304,6 +304,32 @@ public:
     bool                    procRuleClear();
     std::vector<ProcRule>   procRuleList();
 
+    // Driver-load rules. Symmetric to procRule* but enforced inside the
+    // NtLoadDriver prologue hook. Patterns match the service-name leaf
+    // of the registry path (e.g. "Foo" for
+    // "\Registry\Machine\System\CurrentControlSet\Services\Foo"). Catches
+    // both SCM-driven loads and direct ZwLoadDriver callers (including
+    // our own `drv load`). hookLive (out-param on add/list) reports
+    // whether the kernel hook is actually installed -- if FALSE, rules
+    // are stored but inert (HVCI rejected the inline-hook write).
+    enum class DrvRuleAction { Allow = 0, Deny = 1, Log = 2 };
+    struct DrvRule {
+        uint32_t ruleId;
+        uint32_t action;
+        uint32_t matchCount;
+        uint32_t status;          // NTSTATUS returned on DENY
+        std::wstring pattern;
+    };
+    std::optional<uint32_t> drvRuleAdd(std::wstring_view pattern, DrvRuleAction action,
+                                       uint32_t status);
+    bool                    drvRuleRemove(uint32_t ruleId);
+    bool                    drvRuleClear();
+    // hookLive: inline NtLoadDriver hook installed (precise, blocks only loads).
+    // cmLive  : Cm-callback registered (broad, blocks all opens of denied
+    //           service keys; works under HVCI / kernel-CI).
+    std::vector<DrvRule>    drvRuleList(bool* hookLive = nullptr,
+                                        bool* cmLive   = nullptr);
+
     // Process-termination protect rules. Evaluated inside the
     // NtTerminateProcess prologue hook; a target image matching any
     // pattern returns STATUS_ACCESS_DENIED to the terminator. Self-

@@ -629,6 +629,58 @@ std::vector<DriverSession::ProcRule> DriverSession::procRuleList() {
 }
 
 std::optional<uint32_t>
+DriverSession::drvRuleAdd(std::wstring_view pattern, DrvRuleAction action, uint32_t status) {
+    if (pattern.empty() || pattern.size() >= WINTERNAL_DRV_RULE_PATTERN_MAX) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_DRV_RULE in{};
+    WINTERNAL_DRV_RULE out{};
+    in.Action = (uint32_t)action;
+    in.Status = status;
+    std::memcpy(in.Pattern, pattern.data(), pattern.size() * sizeof(wchar_t));
+    in.Pattern[pattern.size()] = 0;
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_DRV_RULE_ADD, &in, sizeof(in), &out, sizeof(out), &ret))
+        return std::nullopt;
+    return out.RuleId;
+}
+
+bool DriverSession::drvRuleRemove(uint32_t ruleId) {
+    WINTERNAL_DRV_RULE_REMOVE_IN in{ ruleId, 0 };
+    return ioctl_(IOCTL_WINTERNAL_DRV_RULE_REMOVE, &in, sizeof(in), nullptr, 0, nullptr);
+}
+
+bool DriverSession::drvRuleClear() {
+    return ioctl_(IOCTL_WINTERNAL_DRV_RULE_CLEAR, nullptr, 0, nullptr, 0, nullptr);
+}
+
+std::vector<DriverSession::DrvRule> DriverSession::drvRuleList(bool* hookLive, bool* cmLive) {
+    std::vector<DrvRule> rules;
+    if (hookLive) *hookLive = false;
+    if (cmLive)   *cmLive   = false;
+    size_t cap = FIELD_OFFSET(WINTERNAL_DRV_RULE_LIST_OUT, Rules)
+               + (size_t)WINTERNAL_DRV_RULE_MAX_RULES * sizeof(WINTERNAL_DRV_RULE);
+    std::vector<uint8_t> buf(cap);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_DRV_RULE_LIST, nullptr, 0, buf.data(), (uint32_t)buf.size(), &ret))
+        return rules;
+    auto* lo = reinterpret_cast<PWINTERNAL_DRV_RULE_LIST_OUT>(buf.data());
+    if (hookLive) *hookLive = (lo->Flags & WINTERNAL_DRV_RULE_FLAG_HOOK_LIVE) != 0;
+    if (cmLive)   *cmLive   = (lo->Flags & WINTERNAL_DRV_RULE_FLAG_CM_LIVE)   != 0;
+    rules.reserve(lo->Count);
+    for (uint32_t i = 0; i < lo->Count; ++i) {
+        DrvRule r;
+        r.ruleId     = lo->Rules[i].RuleId;
+        r.action     = lo->Rules[i].Action;
+        r.matchCount = lo->Rules[i].MatchCount;
+        r.status     = lo->Rules[i].Status;
+        r.pattern    = lo->Rules[i].Pattern;
+        rules.push_back(std::move(r));
+    }
+    return rules;
+}
+
+std::optional<uint32_t>
 DriverSession::procProtectAdd(std::wstring_view pattern, uint32_t status, uint32_t* outFlags) {
     if (pattern.empty() || pattern.size() >= WINTERNAL_PROC_PROTECT_PATTERN_MAX) {
         StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;

@@ -15,15 +15,101 @@
 
 #include "WinternalCore.h"
 #include "../Winternal/Public.h"
+#include "WClap.h"
+#include "Symbols/SymbolResolver.h"
 #include <Windows.h>
 #include <winsvc.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace winternal;
 
 namespace {
+
+// Case-insensitive shell-style wildcard match. Mirrors the kernel-side
+// WinternalMatchWildcard exactly so the CLI pre-check predicts what the
+// driver would do. `*` matches any run of chars (including none), `?` one.
+bool MatchPatternIcase(std::wstring_view pat, std::wstring_view str) {
+    size_t pi = 0, si = 0;
+    size_t starPi = (size_t)-1, starSi = 0;
+    auto lower = [](wchar_t c) -> wchar_t {
+        return (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : c;
+    };
+    while (si < str.size()) {
+        if (pi < pat.size() && pat[pi] == L'*') {
+            starPi = pi++;
+            starSi = si;
+            continue;
+        }
+        if (pi < pat.size()) {
+            wchar_t p = lower(pat[pi]);
+            wchar_t s = lower(str[si]);
+            if (p == L'?' || p == s) { ++pi; ++si; continue; }
+        }
+        if (starPi != (size_t)-1) {
+            pi = starPi + 1;
+            si = ++starSi;
+            continue;
+        }
+        return false;
+    }
+    while (pi < pat.size() && pat[pi] == L'*') ++pi;
+    return pi == pat.size();
+}
+
+const wchar_t* DrvActionName(uint32_t a) {
+    switch (a) {
+    case WINTERNAL_DRV_ACT_ALLOW: return L"ALLOW";
+    case WINTERNAL_DRV_ACT_DENY:  return L"DENY";
+    case WINTERNAL_DRV_ACT_LOG:   return L"LOG";
+    default:                       return L"?";
+    }
+}
+
+int ParseDrvAction(std::wstring_view s) {
+    auto eq = [&](const wchar_t* lit) {
+        if (wcslen(lit) != s.size()) return false;
+        for (size_t i = 0; i < s.size(); ++i) {
+            wchar_t a = s[i]; if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
+            if (a != lit[i]) return false;
+        }
+        return true;
+    };
+    if (eq(L"allow")) return WINTERNAL_DRV_ACT_ALLOW;
+    if (eq(L"deny"))  return WINTERNAL_DRV_ACT_DENY;
+    if (eq(L"log"))   return WINTERNAL_DRV_ACT_LOG;
+    return -1;
+}
+
+// Accepts 0x... NT hex or small decimal Win32 codes (5 = ACCESS_DENIED,
+// 2 = NAME_NOT_FOUND, etc.). Subset of ResolveStatusInput in
+// WinternalCLI.cpp -- duplicated here so this TU doesn't depend on that
+// one's symbol table.
+uint32_t ParseStatusArg(const std::wstring& s) {
+    if (s.empty()) return 0xC0000022u;
+    if (s.size() >= 2 && s[0] == L'0' && (s[1] == L'x' || s[1] == L'X')) {
+        return (uint32_t)wcstoul(s.c_str(), nullptr, 16);
+    }
+    bool hasHex = false, allHex = !s.empty();
+    for (wchar_t c : s) {
+        if ((c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')) hasHex = true;
+        else if (!(c >= L'0' && c <= L'9')) { allHex = false; break; }
+    }
+    if (allHex && (hasHex || s.size() == 8)) return (uint32_t)wcstoul(s.c_str(), nullptr, 16);
+    uint32_t v = (uint32_t)wcstoul(s.c_str(), nullptr, 10);
+    switch (v) {
+    case 0:   return 0x00000000u;
+    case 1:   return 0xC0000034u;   // NAME_NOT_FOUND
+    case 2:   return 0xC0000034u;
+    case 3:   return 0xC000003Au;   // PATH_NOT_FOUND
+    case 5:   return 0xC0000022u;   // ACCESS_DENIED
+    case 87:  return 0xC000000Du;   // INVALID_PARAMETER
+    default:  return v;
+    }
+}
 
 bool IsAdmin() {
     BOOL elev = FALSE; HANDLE tok = nullptr;
@@ -59,7 +145,13 @@ const wchar_t* StartTypeName(DWORD t) {
     return L"?";
 }
 
-int CmdList() {
+int CmdList(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv list");
+    app.about(L"Enumerate kernel-mode service entries from the SCM database. "
+              L"Shows current state (running/stopped) and configured start "
+              L"type (boot/system/auto/demand/disabled).");
+    app.parse(argc, argv);
+
     SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
     if (!scm) { fwprintf(stderr, L"OpenSCManager failed (%lu)\n", ::GetLastError()); return 1; }
 
@@ -121,7 +213,15 @@ ScmHandles OpenSvc(const wchar_t* name, DWORD access) {
     return h;
 }
 
-int CmdStop(const wchar_t* name) {
+int CmdStop(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv stop");
+    app.about(L"Send SERVICE_CONTROL_STOP to a kernel service via SCM. If the "
+              L"service doesn't accept stop (error 1052), use `drv unload` for "
+              L"a kernel-side force-unload via Winternal.sys.")
+       .arg(wclap::Arg(L"name").positional().required().help(L"Service name"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
+
     if (!IsAdmin()) { fwprintf(stderr, L"drv stop: requires admin\n"); return 1; }
     auto h = OpenSvc(name, SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!h.svc) return 1;
@@ -144,7 +244,15 @@ int CmdStop(const wchar_t* name) {
     return 0;
 }
 
-int CmdStart(const wchar_t* name) {
+int CmdStart(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv start");
+    app.about(L"StartService on an existing kernel-service entry. Routes "
+              L"through SCM, which ultimately calls NtLoadDriver -- so `drv "
+              L"rule deny` patterns apply here too.")
+       .arg(wclap::Arg(L"name").positional().required().help(L"Service name"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
+
     if (!IsAdmin()) { fwprintf(stderr, L"drv start: requires admin\n"); return 1; }
     auto h = OpenSvc(name, SERVICE_START);
     if (!h.svc) return 1;
@@ -159,7 +267,24 @@ int CmdStart(const wchar_t* name) {
     return 0;
 }
 
-int CmdSetStartType(const wchar_t* name, DWORD startType) {
+// Shared implementation for enable/disable. startType is fixed by the
+// caller; `verb` is just for nicer error/help text.
+int CmdSetStartType_Impl(int argc, wchar_t** argv, const wchar_t* verb, DWORD startType) {
+    std::wstring progName = std::wstring(L"winternal drv ") + verb;
+    wclap::App app(progName.c_str());
+    if (startType == SERVICE_DEMAND_START) {
+        app.about(L"Set the service StartType to SERVICE_DEMAND_START (3) -- "
+                  L"the service can be brought up on demand via `sc start` / "
+                  L"`drv start`, but doesn't auto-load at boot.");
+    } else {
+        app.about(L"Set the service StartType to SERVICE_DISABLED (4) -- SCM "
+                  L"refuses to start the service until it's re-enabled. "
+                  L"Already-running services keep running until stopped.");
+    }
+    app.arg(wclap::Arg(L"name").positional().required().help(L"Service name"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
+
     if (!IsAdmin()) { fwprintf(stderr, L"requires admin\n"); return 1; }
     auto h = OpenSvc(name, SERVICE_CHANGE_CONFIG);
     if (!h.svc) return 1;
@@ -172,7 +297,19 @@ int CmdSetStartType(const wchar_t* name, DWORD startType) {
     return 0;
 }
 
-int CmdDelete(const wchar_t* name) {
+int CmdEnable(int argc, wchar_t** argv)  { return CmdSetStartType_Impl(argc, argv, L"enable",  SERVICE_DEMAND_START); }
+int CmdDisable(int argc, wchar_t** argv) { return CmdSetStartType_Impl(argc, argv, L"disable", SERVICE_DISABLED); }
+
+int CmdDelete(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv delete");
+    app.about(L"DeleteService on the named entry. Tries SERVICE_CONTROL_STOP "
+              L"first as a best-effort. The driver image stays mapped until "
+              L"reboot if it was actually loaded; this only removes the SCM "
+              L"registration.")
+       .arg(wclap::Arg(L"name").positional().required().help(L"Service name"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
+
     if (!IsAdmin()) { fwprintf(stderr, L"drv delete: requires admin\n"); return 1; }
     auto h = OpenSvc(name, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!h.svc) return 1;
@@ -198,8 +335,53 @@ bool DosToNtPath(const wchar_t* dos, wchar_t* out, size_t outChars) {
     return n > 0;
 }
 
-int CmdLoad(const wchar_t* name, const wchar_t* sysPath) {
+// CLI-side pre-check: walk the kernel rule list and, if a DENY rule
+// matches the service name, refuse the load with a friendlier error
+// than the kernel's STATUS_ACCESS_DENIED. The kernel hook is still the
+// load-bearing enforcement; this just gives users a nice "rule N
+// matched" message before we issue the IOCTL. Returns true if the load
+// should proceed.
+bool DrvRulePrecheck(const wchar_t* name) {
+    DriverSession ds;
+    if (!ds.open()) return true;       // driver not loaded -> no rules to honor
+    bool hookLive = false, cmLive = false;
+    auto rules = ds.drvRuleList(&hookLive, &cmLive);
+    if (rules.empty()) return true;
+    for (auto& r : rules) {
+        if (r.action != WINTERNAL_DRV_ACT_DENY) continue;
+        if (!MatchPatternIcase(r.pattern, name)) continue;
+        uint32_t st = r.status ? r.status : 0xC0000022u;
+        const wchar_t* warn =
+            (!hookLive && !cmLive) ? L" [NEITHER layer live -- rule listed but not enforced kernel-side]"
+                                   : L"";
+        fwprintf(stderr,
+            L"drv load %ls: blocked by rule %u (pattern '%ls' -> DENY, status 0x%08X)%ls\n",
+            name, r.ruleId, r.pattern.c_str(), st, warn);
+        return false;
+    }
+    return true;
+}
+
+int CmdLoad(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv load");
+    app.about(L"Register a kernel service for the given .sys file and start "
+              L"it. Prefers the Winternal.sys kernel path (single privileged "
+              L"dispatch in the audit log) and falls back to SCM "
+              L"CreateService+StartService when the driver isn't loaded.\n"
+              L"\n"
+              L"Honors `drv rule deny` patterns -- pre-check happens client-\n"
+              L"side BEFORE the IOCTL so the user gets a friendly error, and\n"
+              L"the kernel NtLoadDriver hook is the load-bearing enforcer.")
+       .arg(wclap::Arg(L"name").positional().required()
+                .help(L"Service name (registry key under \\Services\\<name>)"))
+       .arg(wclap::Arg(L"sys-path").positional().required()
+                .help(L"Path to the .sys file (relative or absolute)"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name    = m.value(L"name")->c_str();
+    const wchar_t* sysPath = m.value(L"sys-path")->c_str();
+
     if (!IsAdmin()) { fwprintf(stderr, L"drv load: requires admin\n"); return 1; }
+    if (!DrvRulePrecheck(name)) return 1;
 
     wchar_t full[MAX_PATH], ntPath[MAX_PATH + 8];
     if (!::GetFullPathNameW(sysPath, MAX_PATH, full, nullptr)) {
@@ -273,7 +455,18 @@ int CmdLoad(const wchar_t* name, const wchar_t* sysPath) {
     return 1;
 }
 
-int CmdForceUnload(const wchar_t* name) {
+int CmdForceUnload(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv unload");
+    app.about(L"Kernel-side force-unload via Winternal.sys: resolves the "
+              L"driver object by name and calls its DriverUnload routine "
+              L"directly, bypassing SCM. Use when SCM stop fails (error "
+              L"1052). The image stays mapped until reboot; pair with "
+              L"`drv delete` to remove the SCM entry.")
+       .arg(wclap::Arg(L"name").positional().required()
+                .help(L"Driver object name (no \\Driver\\ prefix)"));
+    auto m = app.parse(argc, argv);
+    const wchar_t* name = m.value(L"name")->c_str();
+
     DriverSession ds;
     if (!ds.open()) {
         fwprintf(stderr, L"drv unload: Winternal.sys is not loaded (open failed: %lu)\n", ::GetLastError());
@@ -288,17 +481,178 @@ int CmdForceUnload(const wchar_t* name) {
     return 0;
 }
 
-int Usage() {
-    fwprintf(stderr,
-        L"usage: winternal drv <subcommand> [args]\n"
-        L"  list                          enumerate kernel-mode services\n"
-        L"  load    <name> <sys-path>    create service + start it\n"
-        L"  start   <name>                SCM start an existing service\n"
-        L"  stop    <name>                SCM stop\n"
-        L"  enable  <name>                StartType = demand\n"
-        L"  disable <name>                StartType = disabled\n"
-        L"  delete  <name>                DeleteService (after best-effort stop)\n"
-        L"  unload  <name>                force kernel unload (uses Winternal.sys)\n");
+int CmdRuleAdd(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv rule add");
+    app.about(L"Install a driver-load block rule. Patterns are case-insensitive "
+              L"shell wildcards matched against the service-name leaf of the "
+              L"registry path NtLoadDriver receives -- e.g. `Foo` for "
+              L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\Foo. "
+              L"Catches SCM-driven loads (services.exe) AND direct ZwLoadDriver "
+              L"callers (including our own `drv load`).\n"
+              L"\n"
+              L"--status overrides the NTSTATUS the loader sees on DENY. "
+              L"Default 5 (STATUS_ACCESS_DENIED). Decimal Win32 codes or 0x... "
+              L"NT hex accepted. Status is ignored for allow/log.\n"
+              L"\n"
+              L"WARNING: a pattern like `*` blocks ALL further driver loads. "
+              L"Boot-time services already running aren't affected, but anything "
+              L"new -- including filter drivers SCM tries to bring up on demand -- "
+              L"will fail. Test on a VM.")
+       .arg(wclap::Arg(L"pattern").positional().required()
+                .help(L"Wildcard pattern against the service name"))
+       .arg(wclap::Arg(L"action").positional().required()
+                .help(L"allow | deny | log"))
+       .arg(wclap::Arg(L"status").long_name(L"status").takes_value()
+                .default_value(L"5")
+                .help(L"NTSTATUS for DENY (decimal Win32 or 0x... NT hex). Default 5."));
+    auto m = app.parse(argc, argv);
+    std::wstring pattern = *m.value(L"pattern");
+    int act = ParseDrvAction(*m.value(L"action"));
+    if (act < 0) {
+        fwprintf(stderr, L"drv rule add: bad action '%ls' (use allow|deny|log)\n",
+                 m.value(L"action")->c_str());
+        return 1;
+    }
+    uint32_t status = ParseStatusArg(*m.value(L"status"));
+
+    DriverSession ds;
+    if (!ds.open()) {
+        fwprintf(stderr, L"drv rule add: Winternal.sys is not loaded (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    auto id = ds.drvRuleAdd(pattern, (DriverSession::DrvRuleAction)act, status);
+    if (!id) {
+        DWORD e = ::GetLastError();
+        fwprintf(stderr, L"drv rule add: failed (%lu)\n", e);
+        if (e == ERROR_NOT_READY) {
+            // Neither the inline hook NOR the Cm callback registered. The
+            // inline hook can fail under HVCI / WDAC; the Cm callback fails
+            // for things like altitude collision or driver not yet fully
+            // initialized. Both failing simultaneously is rare and usually
+            // means the driver was loaded into a really hostile environment.
+            fwprintf(stderr,
+                L"  hint: no enforcement layer is live. Both the NtLoadDriver\n"
+                L"  inline hook AND the Cm-callback fallback failed to register.\n"
+                L"  Check kernel debug output for the specific status codes.\n");
+        }
+        return 1;
+    }
+    wprintf(L"added drv rule %u: %ls -> %ls (status 0x%08X)\n",
+            *id, pattern.c_str(), DrvActionName((uint32_t)act), status);
+    return 0;
+}
+
+int CmdRuleList(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv rule list");
+    app.about(L"List installed driver-load rules and whether the NtLoadDriver "
+              L"hook is actually live (HVCI can reject the install).");
+    app.parse(argc, argv);
+
+    DriverSession ds;
+    if (!ds.open()) {
+        fwprintf(stderr, L"drv rule list: Winternal.sys is not loaded (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    bool hookLive = false, cmLive = false;
+    auto rules = ds.drvRuleList(&hookLive, &cmLive);
+    if (hookLive && cmLive) {
+        wprintf(L"enforcement: NtLoadDriver inline hook + Cm-callback (defense in depth)\n");
+    } else if (hookLive) {
+        wprintf(L"enforcement: NtLoadDriver inline hook (precise, blocks only loads)\n");
+    } else if (cmLive) {
+        wprintf(L"enforcement: Cm-callback on \\Services\\<denied> (also blocks `sc query`, `reg query`)\n");
+    } else {
+        wprintf(L"enforcement: INACTIVE (rules listed but not enforced)\n");
+    }
+    if (rules.empty()) { wprintf(L"(no rules)\n"); return 0; }
+    wprintf(L"%-6ls  %-6ls  %-12ls  %-7ls  %ls\n",
+            L"ID", L"ACTION", L"STATUS", L"HITS", L"PATTERN");
+    for (auto& r : rules) {
+        wprintf(L"%-6u  %-6ls  0x%08X    %-7u  %ls\n",
+                r.ruleId, DrvActionName(r.action),
+                r.status, r.matchCount, r.pattern.c_str());
+    }
+    return 0;
+}
+
+int CmdRuleRemove(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv rule remove");
+    app.about(L"Remove a drv rule by ID (see `drv rule list`).")
+       .arg(wclap::Arg(L"id").positional().required().help(L"Rule ID (decimal)"));
+    auto m = app.parse(argc, argv);
+    uint32_t id = (uint32_t)*m.value_u64(L"id");
+
+    DriverSession ds;
+    if (!ds.open()) {
+        fwprintf(stderr, L"drv rule remove: Winternal.sys is not loaded (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    if (!ds.drvRuleRemove(id)) {
+        fwprintf(stderr, L"drv rule remove %u: failed (%lu)\n", id, ::GetLastError());
+        return 1;
+    }
+    wprintf(L"rule %u removed\n", id);
+    return 0;
+}
+
+int CmdRuleClear(int argc, wchar_t** argv) {
+    wclap::App app(L"winternal drv rule clear");
+    app.about(L"Remove every driver-load rule.");
+    app.parse(argc, argv);
+
+    DriverSession ds;
+    if (!ds.open()) {
+        fwprintf(stderr, L"drv rule clear: Winternal.sys is not loaded (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    if (!ds.drvRuleClear()) {
+        fwprintf(stderr, L"drv rule clear: failed (%lu)\n", ::GetLastError());
+        return 1;
+    }
+    wprintf(L"all drv rules cleared\n");
+    return 0;
+}
+
+int CmdRule(int argc, wchar_t** argv) {
+    if (argc < 1) {
+        wclap::App app(L"winternal drv rule");
+        app.about(L"Prohibit kernel-driver loads by pattern. Symmetric to "
+                  L"`proc rule` but enforced inside the NtLoadDriver prologue "
+                  L"hook -- catches every load path (SCM, direct ZwLoadDriver, "
+                  L"our own `drv load`).")
+           .subcommand(wclap::App(L"add").about(L"Install a rule"))
+           .subcommand(wclap::App(L"list").about(L"Show installed rules + hook state"))
+           .subcommand(wclap::App(L"remove").about(L"Remove a rule by ID"))
+           .subcommand(wclap::App(L"clear").about(L"Remove all rules"));
+        app.print_help(stderr);
+        return 1;
+    }
+    std::wstring_view sub = argv[0];
+    int sa = argc - 1;
+    wchar_t** av = argv + 1;
+    if (sub == L"add")    return CmdRuleAdd(sa, av);
+    if (sub == L"list")   return CmdRuleList(sa, av);
+    if (sub == L"remove") return CmdRuleRemove(sa, av);
+    if (sub == L"clear")  return CmdRuleClear(sa, av);
+    fwprintf(stderr, L"drv rule: unknown action '%ls'\n", argv[0]);
+    return 1;
+}
+
+int PrintTopHelp() {
+    wclap::App app(L"winternal drv");
+    app.about(L"Kernel-driver management: list / load / start / stop / "
+              L"enable / disable / delete / unload kernel-mode services, "
+              L"and `rule` to prohibit driver loads by name pattern.")
+       .subcommand(wclap::App(L"list").about(L"Enumerate kernel-mode service entries"))
+       .subcommand(wclap::App(L"load").about(L"Register + start a kernel service"))
+       .subcommand(wclap::App(L"start").about(L"SCM start an existing service"))
+       .subcommand(wclap::App(L"stop").about(L"SCM stop"))
+       .subcommand(wclap::App(L"enable").about(L"StartType = demand"))
+       .subcommand(wclap::App(L"disable").about(L"StartType = disabled"))
+       .subcommand(wclap::App(L"delete").about(L"DeleteService (best-effort stop first)"))
+       .subcommand(wclap::App(L"unload").about(L"Force kernel unload via Winternal.sys"))
+       .subcommand(wclap::App(L"rule").about(L"Prohibit kernel-driver loads by name pattern"));
+    app.print_help(stderr);
     return 1;
 }
 
@@ -306,20 +660,21 @@ int Usage() {
 
 namespace winternal {
 int RunDriverMgmt(int argc, wchar_t** argv) {
-    if (argc < 1) return Usage();
+    if (argc < 1) return PrintTopHelp();
     std::wstring_view sub = argv[0];
-    if (sub == L"list") return CmdList();
-    if (argc < 2) { fwprintf(stderr, L"drv %s: missing service name\n", argv[0]); return 1; }
-    if (sub == L"load") {
-        if (argc < 3) { fwprintf(stderr, L"drv load: usage: drv load <name> <sys-path>\n"); return 1; }
-        return CmdLoad(argv[1], argv[2]);
-    }
-    if (sub == L"stop")    return CmdStop(argv[1]);
-    if (sub == L"start")   return CmdStart(argv[1]);
-    if (sub == L"enable")  return CmdSetStartType(argv[1], SERVICE_DEMAND_START);
-    if (sub == L"disable") return CmdSetStartType(argv[1], SERVICE_DISABLED);
-    if (sub == L"delete")  return CmdDelete(argv[1]);
-    if (sub == L"unload")  return CmdForceUnload(argv[1]);
-    return Usage();
+    int sa = argc - 1;
+    wchar_t** av = argv + 1;
+    if (sub == L"list")    return CmdList(sa, av);
+    if (sub == L"load")    return CmdLoad(sa, av);
+    if (sub == L"start")   return CmdStart(sa, av);
+    if (sub == L"stop")    return CmdStop(sa, av);
+    if (sub == L"enable")  return CmdEnable(sa, av);
+    if (sub == L"disable") return CmdDisable(sa, av);
+    if (sub == L"delete")  return CmdDelete(sa, av);
+    if (sub == L"unload")  return CmdForceUnload(sa, av);
+    if (sub == L"rule")    return CmdRule(sa, av);
+    if (sub == L"--help" || sub == L"-h" || sub == L"help") { (void)PrintTopHelp(); return 0; }
+    fwprintf(stderr, L"drv: unknown subcommand '%ls'\n", argv[0]);
+    return PrintTopHelp();
 }
 }
