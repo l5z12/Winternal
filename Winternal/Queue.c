@@ -289,7 +289,26 @@ static KSERVICE_TABLE_DESCRIPTOR* LocateServiceDescriptor(void)
 
 #define WINTERNAL_KHOOK_JMP_SIZE   14
 #define WINTERNAL_KHOOK_MAX_PROLOG 64
-#define WINTERNAL_KHOOK_TRAMP_SIZE (WINTERNAL_KHOOK_MAX_PROLOG + WINTERNAL_KHOOK_JMP_SIZE + 16)
+// Trampoline = copied prolog + JMP back + a tail of 8-byte data slots.
+// Slots hold snapshots of stable references (IAT entries, security
+// cookies, CFG dispatch tables) for RIP-relative instructions whose
+// disp32 can't reach back to the original location -- which is the
+// common case in modern Win11 where the target's image and our pool
+// allocations are tens of TB apart in VA. 8 slots covers anything we'd
+// reasonably see in a 64-byte prologue.
+#define WINTERNAL_KHOOK_DATA_SLOTS 8
+#define WINTERNAL_KHOOK_TRAMP_SIZE (WINTERNAL_KHOOK_MAX_PROLOG + WINTERNAL_KHOOK_JMP_SIZE + WINTERNAL_KHOOK_DATA_SLOTS * 8)
+
+// Verbose log line for the destroy-hook install / write-code paths. All
+// lines share the `[winternal-destroy]` prefix so debug-print consumers
+// can grep them out. Routes through the same DbgPrintEx component +
+// level as the existing `[winternal] ...` lines elsewhere in this
+// driver, because the user's repro box has the IHVDRIVER mask already
+// whitelisted in `Debug Print Filter` -- plain DbgPrint goes via
+// DPFLTR_DEFAULT_ID at INFO level and gets dropped on free builds.
+#define DLOG(fmt, ...) \
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+               "[winternal-destroy] " fmt "\n", ##__VA_ARGS__)
 
 typedef struct _WINTERNAL_KHOOK_ENTRY {
     LIST_ENTRY  ListEntry;
@@ -1192,46 +1211,111 @@ static VOID WinternalProtectForceIntegrity(VOID)
 // user's system); we drive the write ourselves below.
 static VOID KhookWriteJmpAbs(PUCHAR Dst, PVOID To);
 
-// Bypass kernel WP for a single write from the current CPU. Avoid raising
-// IRQL — at DPC_LEVEL a paging fault would BSOD, and we don't need SMP
-// coherence for ObUnRegisterCallbacks (called rarely enough that a torn-
-// write window is effectively zero risk). Reads the bytes back after the
-// write so we can detect silent HVCI/VBS rejection and report failure.
-static NTSTATUS WinternalProtectWriteCode(PVOID Target, const VOID* Src, SIZE_T Length)
+// Approach #1: clear CR0.WP on this CPU, write directly, restore.
+// Cheap and clean when it works. On Win11 24H2 with VBS active, the
+// hypervisor intercepts `mov cr0` and #GPs us (STATUS_PRIVILEGED_
+// INSTRUCTION 0xC0000096). We catch the fault with SEH so the caller
+// can try the MDL-alias fallback below.
+static NTSTATUS WinternalProtectWriteCodeCr0(PVOID Target, const VOID* Src, SIZE_T Length)
 {
-    // Earlier rev raised IRQL to APC_LEVEL and did _disable() to keep the
-    // CR0.WP=0 window invisible to other threads. That created a deadlock
-    // when the write faulted (page-fault handler couldn't run with
-    // interrupts masked at elevated IRQL, so RtlCopyMemory wedged
-    // indefinitely). At PASSIVE_LEVEL the fault path is fully serviceable
-    // and SEH can actually catch the access violation.
-    //
-    // Trade-off: brief window where this CPU's CR0.WP is 0, observable to
-    // any concurrent kernel code on this CPU. For a research driver that's
-    // the right call vs. hanging the system. SMP coherence — other CPUs
-    // see their own CR0, this only affects ours.
     NTSTATUS status = STATUS_SUCCESS;
-    // Wrap the ENTIRE CR0 sequence — not just the RtlCopyMemory — because
-    // Hyper-V/VBS intercepts the `mov cr0, ...` instruction itself and
-    // injects a #GP (STATUS_PRIVILEGED_INSTRUCTION) when VBS is enforcing
-    // EPT write-protection of kernel code pages. An __try around only the
-    // RtlCopyMemory lets that fault escape unhandled to the dispatcher.
     __try {
         ULONG_PTR cr0 = __readcr0();
-        __writecr0(cr0 & ~0x10000ULL);          // clear WP (bit 16) on this CPU
+        __writecr0(cr0 & ~0x10000ULL);          // clear WP (bit 16)
         RtlCopyMemory(Target, Src, Length);
         __writecr0(cr0);                         // restore
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
-
     if (NT_SUCCESS(status)) {
-        // HVCI may swallow the write silently; verify by reading back.
         if (RtlCompareMemory(Target, Src, Length) != Length) {
             status = STATUS_NOT_SUPPORTED;
         }
     }
     return status;
+}
+
+// Approach #2: build an MDL for the target kernel page, MmMapLocked-
+// PagesSpecifyCache to get a *second* virtual address mapped to the same
+// physical page, mark that alias mapping writable, then write through
+// the alias. The original VA stays RO; the CPU never touches CR0; the
+// VBS hypervisor has nothing to intercept on the mov cr0 path.
+//
+// What VBS / HVCI can still do to stop this: if HVCI is fully on, the
+// secure kernel marks the underlying PFN as RO in the EPT, and any store
+// to ANY VA mapping that PFN is rejected at the EPT level. In that case
+// MmProtectMdlSystemAddress returns STATUS_ACCESS_DENIED or the write
+// faults despite the local PTE allowing it. So this is a "works when
+// only the CR0 intercept is on, not when EPT write-protection is too"
+// fallback. On the user's machine VBS reports "off" but is still
+// intercepting CR0 -- exactly the partial-on state where MDL alias has
+// a real chance.
+static NTSTATUS WinternalProtectWriteCodeMdl(PVOID Target, const VOID* Src, SIZE_T Length)
+{
+    PMDL mdl = IoAllocateMdl(Target, (ULONG)Length, FALSE, FALSE, NULL);
+    if (!mdl) return STATUS_INSUFFICIENT_RESOURCES;
+
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    PVOID writableVa = NULL;
+    BOOLEAN locked = FALSE;
+
+    __try {
+        // Kernel code pages are non-paged and resident, but they aren't
+        // in the pool — so we can't use MmBuildMdlForNonPagedPool. Use
+        // MmProbeAndLockPages with KernelMode + IoModifyAccess; for non-
+        // paged kernel pages this is essentially "set up the PFN list
+        // and mark the MDL as available for mapping with write intent".
+        MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
+        locked = TRUE;
+
+        writableVa = MmMapLockedPagesSpecifyCache(
+            mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+        if (!writableVa) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            __leave;
+        }
+        // Force the alias mapping to PAGE_EXECUTE_READWRITE so the
+        // local PTE permits the store. (If HVCI's EPT also enforces RO,
+        // this returns an error or the write below faults.)
+        status = MmProtectMdlSystemAddress(mdl, PAGE_EXECUTE_READWRITE);
+        if (!NT_SUCCESS(status)) __leave;
+
+        RtlCopyMemory(writableVa, Src, Length);
+        status = STATUS_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
+
+    if (writableVa) MmUnmapLockedPages(writableVa, mdl);
+    if (locked)     MmUnlockPages(mdl);
+    IoFreeMdl(mdl);
+
+    if (NT_SUCCESS(status)) {
+        if (RtlCompareMemory(Target, Src, Length) != Length) {
+            status = STATUS_NOT_SUPPORTED;
+        }
+    }
+    return status;
+}
+
+// Bypass kernel WP for a single write. Tries the CR0.WP toggle first;
+// on VBS systems where the hypervisor intercepts mov cr0, falls back
+// to the MDL-alias method. If both fail, returns the last error so the
+// caller can surface it.
+static NTSTATUS WinternalProtectWriteCode(PVOID Target, const VOID* Src, SIZE_T Length)
+{
+    NTSTATUS s = WinternalProtectWriteCodeCr0(Target, Src, Length);
+    DLOG("ProtectWriteCode: Cr0 path target=%p len=%llu -> 0x%08X",
+         Target, (ULONGLONG)Length, s);
+    if (NT_SUCCESS(s)) return s;
+    // CR0 path failed (likely VBS intercept). The MDL alias path doesn't
+    // touch CR0, so it survives the hypervisor's cr0-write filter --
+    // unless HVCI's EPT is also enforcing RO on the underlying PFN, in
+    // which case we'll fault on the actual store and propagate that.
+    NTSTATUS m = WinternalProtectWriteCodeMdl(Target, Src, Length);
+    DLOG("ProtectWriteCode: Mdl path  target=%p len=%llu -> 0x%08X",
+         Target, (ULONGLONG)Length, m);
+    return NT_SUCCESS(m) ? m : s;
 }
 
 static VOID NTAPI WinternalObUnreg_Detour(_In_ PVOID RegistrationHandle)
@@ -2160,6 +2244,19 @@ static VOID WinternalProcNotify(
 // further down, after the proc-monitor globals it relies on).
 static NTSTATUS WinternalInstallNtTermHook(VOID);
 static VOID     WinternalUninstallNtTermHook(VOID);
+// Same shape for the win32k NtUserDestroyWindow hook. HandleWinRuleAdd
+// installs it lazily on the first block-destroy rule; WinternalProc-
+// MonitorShutdown tears it down on driver unload.
+static NTSTATUS WinternalInstallDestroyWindowHook(VOID);
+static NTSTATUS WinternalInstallDestroyWindowHookAt(PVOID Target);
+static NTSTATUS WinternalFindKernelModule(PCWSTR ModuleBaseNameW, PVOID* OutBase, PULONG OutSize);
+static NTSTATUS WinternalInstallHookByRva(UINT32 HookId, PVOID TargetVa);
+static VOID     WinternalUninstallDestroyWindowHook(VOID);
+static PRTL_PROCESS_MODULES QueryAllModules(void);
+// Defined alongside the hook below; forward-declared so HandleWinRuleAdd /
+// HandleWinRuleList can read the install state.
+static BOOLEAN  g_DestroyWinHookInstalled;
+static NTSTATUS g_DestroyWinLastInstallStatus;  // 0 = never attempted
 
 NTSTATUS WinternalProcMonitorInit(VOID)
 {
@@ -2505,12 +2602,248 @@ static NTSTATUS HandleProcProtectClear(VOID)
     return STATUS_SUCCESS;
 }
 
+// ---- Window rules (driver-resident storage) ----
+//
+// Storage only in phase 1: the shield DLL (`WinternalWinShield.dll`)
+// loaded into every GUI process by `winternal win protect` reads this
+// list via IOCTL and does the actual subclass-drop / WH_CBT abort.
+// Phase 2 (future) will add a kernel inline hook on NtUserDestroyWindow
+// for true driver-side prohibition; storage lives here so phase 2 has
+// the rule list ready without a CLI roundtrip.
+
+typedef struct _WN_WIN_RULE_LIVE {
+    UINT32 RuleId;
+    UINT32 Kind;            // WINTERNAL_WIN_KIND_*
+    UINT32 Action;          // WINTERNAL_WIN_ACT_*
+    UINT32 HitCount;
+    WCHAR  Pattern[WINTERNAL_WIN_RULE_PATTERN_MAX];
+    USHORT PatternLen;      // wchars excluding NUL
+} WN_WIN_RULE_LIVE;
+
+static WN_WIN_RULE_LIVE g_WinRules[WINTERNAL_WIN_RULE_MAX_RULES];
+static ULONG      g_WinRuleCount   = 0;
+static UINT32     g_WinRuleNextId  = 1;
+static KSPIN_LOCK g_WinRuleSpin;
+static BOOLEAN    g_WinRuleSpinInit = FALSE;
+
+static VOID WinternalWinRuleEnsureInit(VOID)
+{
+    if (!g_WinRuleSpinInit) {
+        KeInitializeSpinLock(&g_WinRuleSpin);
+        g_WinRuleSpinInit = TRUE;
+    }
+}
+
+static NTSTATUS HandleWinRuleAdd(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_WIN_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_WIN_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_WIN_RULE in = (PWINTERNAL_WIN_RULE)InBuf;
+
+    USHORT plen = 0;
+    while (plen < WINTERNAL_WIN_RULE_PATTERN_MAX && in->Pattern[plen]) ++plen;
+    if (plen == 0 || plen >= WINTERNAL_WIN_RULE_PATTERN_MAX) return STATUS_INVALID_PARAMETER;
+    if (in->Kind < WINTERNAL_WIN_KIND_TITLE_GLOB ||
+        in->Kind > WINTERNAL_WIN_KIND_IMAGE_GLOB) return STATUS_INVALID_PARAMETER;
+    if (in->Action > WINTERNAL_WIN_ACT_BLOCK_DESTROY) return STATUS_INVALID_PARAMETER;
+
+    // block-destroy is the kernel-enforced path; install the inline hook
+    // on NtUserDestroyWindow lazily on the first such rule. Failure is
+    // non-fatal -- the rule is still stored, just not enforced. The
+    // last-attempt status is stashed in g_DestroyWinLastInstallStatus and
+    // reported back to user-mode via WINTERNAL_WIN_RULE.LastHookError so
+    // the CLI can show the user *why* the hook didn't install instead of
+    // making them dig through DbgView.
+    if (in->Action == WINTERNAL_WIN_ACT_BLOCK_DESTROY) {
+        DLOG("WinRuleAdd: BLOCK_DESTROY rule (kind=%u patternLen=%u) -- triggering export-table install path",
+             in->Kind, plen);
+        NTSTATUS hs;
+        __try {
+            hs = WinternalInstallDestroyWindowHook();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            hs = (NTSTATUS)GetExceptionCode();
+            DLOG("WinRuleAdd: SEH caught from InstallDestroyWindowHook -> 0x%08X", hs);
+        }
+        g_DestroyWinLastInstallStatus = hs;
+        DLOG("WinRuleAdd: InstallDestroyWindowHook returned 0x%08X (installed=%u)",
+             hs, g_DestroyWinHookInstalled);
+        if (!NT_SUCCESS(hs)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] block-destroy hook install failed: 0x%08X "
+                       "(rule will be stored but inactive)\n", hs);
+        }
+    }
+
+    WinternalWinRuleEnsureInit();
+    KIRQL irql;
+    KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+    if (g_WinRuleCount >= WINTERNAL_WIN_RULE_MAX_RULES) {
+        KeReleaseSpinLock(&g_WinRuleSpin, irql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    WN_WIN_RULE_LIVE* r = &g_WinRules[g_WinRuleCount];
+    r->RuleId   = g_WinRuleNextId++;
+    r->Kind     = in->Kind;
+    r->Action   = in->Action;
+    r->HitCount = 0;
+    RtlCopyMemory(r->Pattern, in->Pattern, plen * sizeof(WCHAR));
+    r->Pattern[plen] = 0;
+    r->PatternLen = plen;
+    UINT32 assignedId = r->RuleId;
+    ++g_WinRuleCount;
+    KeReleaseSpinLock(&g_WinRuleSpin, irql);
+
+    PWINTERNAL_WIN_RULE out = (PWINTERNAL_WIN_RULE)OutBuf;
+    RtlCopyMemory(out, in, sizeof(*out));
+    out->RuleId        = assignedId;
+    out->HitCount      = 0;
+    out->Flags         = g_DestroyWinHookInstalled ? WINTERNAL_WIN_FLAG_DESTROY_HOOK_LIVE : 0;
+    out->LastHookError = (UINT32)g_DestroyWinLastInstallStatus;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleWinRuleRemove(PVOID InBuf, size_t InLen)
+{
+    if (InLen < sizeof(WINTERNAL_WIN_RULE_REMOVE_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_WIN_RULE_REMOVE_IN in = (PWINTERNAL_WIN_RULE_REMOVE_IN)InBuf;
+    if (!g_WinRuleSpinInit) return STATUS_NOT_FOUND;
+
+    KIRQL irql;
+    BOOLEAN removed = FALSE;
+    KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+    for (ULONG i = 0; i < g_WinRuleCount; ++i) {
+        if (g_WinRules[i].RuleId == in->RuleId) {
+            for (ULONG j = i; j + 1 < g_WinRuleCount; ++j) g_WinRules[j] = g_WinRules[j + 1];
+            --g_WinRuleCount;
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_WinRuleSpin, irql);
+    return removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static NTSTATUS HandleWinRuleList(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_WIN_RULE_LIST_OUT, Rules);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_WIN_RULE_LIST_OUT out = (PWINTERNAL_WIN_RULE_LIST_OUT)OutBuf;
+    ULONG maxRules = (ULONG)((OutLen - header) / sizeof(WINTERNAL_WIN_RULE));
+
+    if (!g_WinRuleSpinInit) {
+        out->Count = 0; out->Reserved = 0;
+        *Written = header;
+        return STATUS_SUCCESS;
+    }
+    KIRQL irql;
+    KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+    ULONG toReturn = g_WinRuleCount < maxRules ? g_WinRuleCount : maxRules;
+    for (ULONG i = 0; i < toReturn; ++i) {
+        out->Rules[i].RuleId        = g_WinRules[i].RuleId;
+        out->Rules[i].Kind          = g_WinRules[i].Kind;
+        out->Rules[i].Action        = g_WinRules[i].Action;
+        out->Rules[i].HitCount      = g_WinRules[i].HitCount;
+        out->Rules[i].Flags         = (g_WinRules[i].Action == WINTERNAL_WIN_ACT_BLOCK_DESTROY
+                                       && g_DestroyWinHookInstalled)
+                                       ? WINTERNAL_WIN_FLAG_DESTROY_HOOK_LIVE : 0;
+        out->Rules[i].LastHookError = (UINT32)g_DestroyWinLastInstallStatus;
+        RtlCopyMemory(out->Rules[i].Pattern, g_WinRules[i].Pattern,
+                      (g_WinRules[i].PatternLen + 1) * sizeof(WCHAR));
+    }
+    out->Count = toReturn;
+    out->Reserved = 0;
+    KeReleaseSpinLock(&g_WinRuleSpin, irql);
+
+    *Written = header + toReturn * sizeof(WINTERNAL_WIN_RULE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleWinRuleClear(VOID)
+{
+    if (!g_WinRuleSpinInit) return STATUS_SUCCESS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+    RtlZeroMemory(g_WinRules, sizeof(g_WinRules));
+    g_WinRuleCount  = 0;
+    g_WinRuleNextId = 1;
+    KeReleaseSpinLock(&g_WinRuleSpin, irql);
+    return STATUS_SUCCESS;
+}
+
+// Handler for IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA. CLI has already done
+// the symbol -> RVA lookup against the matching PDB; we just have to
+// validate the (Module, RVA) tuple and feed the resulting absolute VA
+// into the appropriate hook installer.
+static NTSTATUS HandleHookInstallByRva(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_HOOK_RVA_REQ))  return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_HOOK_RVA_RESP)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_HOOK_RVA_REQ  in  = (PWINTERNAL_HOOK_RVA_REQ)InBuf;
+    PWINTERNAL_HOOK_RVA_RESP out = (PWINTERNAL_HOOK_RVA_RESP)OutBuf;
+    RtlZeroMemory(out, sizeof(*out));
+
+    // Enforce NUL termination -- the field is fixed-size and untrusted.
+    BOOLEAN terminated = FALSE;
+    for (SIZE_T i = 0; i < RTL_NUMBER_OF(in->Module); ++i) {
+        if (in->Module[i] == 0) { terminated = TRUE; break; }
+    }
+    if (!terminated || in->Module[0] == 0) return STATUS_INVALID_PARAMETER;
+    if (in->Rva == 0) return STATUS_INVALID_PARAMETER;
+
+    DLOG("HookInstallByRva: module='%ls' rva=0x%X hookId=%u callerPid=%lu callerImg='%s'",
+         in->Module, in->Rva, in->HookId,
+         (ULONG)(ULONG_PTR)PsGetCurrentProcessId(),
+         PsGetProcessImageFileName(PsGetCurrentProcess()));
+
+    PVOID base = NULL;
+    ULONG size = 0;
+    NTSTATUS s = WinternalFindKernelModule(in->Module, &base, &size);
+    if (!NT_SUCCESS(s)) {
+        DLOG("HookInstallByRva: FindKernelModule('%ls') -> 0x%08X", in->Module, s);
+        out->NtStatus = (UINT32)s; *Written = sizeof(*out); return s;
+    }
+    DLOG("HookInstallByRva: module base=%p size=0x%X", base, size);
+
+    // Need at least JMP_SIZE bytes of room after the target for the patch
+    // itself. Use MAX_PROLOG to be safe -- the prolog boundary scan may
+    // walk a little further than JMP_SIZE before finding a clean stop.
+    if ((ULONGLONG)in->Rva + WINTERNAL_KHOOK_MAX_PROLOG > size) {
+        DLOG("HookInstallByRva: rva 0x%X + MAX_PROLOG > size 0x%X", in->Rva, size);
+        out->NtStatus = (UINT32)STATUS_INVALID_PARAMETER;
+        *Written = sizeof(*out);
+        return STATUS_INVALID_PARAMETER;
+    }
+    PVOID targetVa = (PUCHAR)base + in->Rva;
+    out->ResolvedVa = (UINT64)(ULONG_PTR)targetVa;
+
+    NTSTATUS hs;
+    __try {
+        hs = WinternalInstallHookByRva(in->HookId, targetVa);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hs = (NTSTATUS)GetExceptionCode();
+        DLOG("HookInstallByRva: SEH caught 0x%08X", hs);
+    }
+    // Mirror into the same status field the regular install path uses, so
+    // `win rule list` keeps reflecting the most-recent attempt's result.
+    if (in->HookId == WINTERNAL_HOOK_ID_DESTROY_WINDOW) {
+        g_DestroyWinLastInstallStatus = hs;
+    }
+    out->NtStatus  = (UINT32)hs;
+    out->Installed = NT_SUCCESS(hs) ? 1u : 0u;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;  // IOCTL itself succeeded; per-hook outcome in body
+}
+
 VOID WinternalProcMonitorShutdown(VOID)
 {
     // Called from the driver-unload path to make sure the kernel
     // doesn't keep a dangling pointer to our notify routine OR to the
     // NtTerminateProcess detour (jmp into freed pool = guaranteed BSOD).
+    // Same applies to the NtUserDestroyWindow hook -- pull both before
+    // we let any other teardown free pool that might back the trampolines.
     WinternalUninstallNtTermHook();
+    WinternalUninstallDestroyWindowHook();
     InterlockedExchange(&g_ProcMonActive, 0);
     if (InterlockedCompareExchange(&g_ProcNotifyReg, 0, 1) == 1) {
         (void)PsSetCreateProcessNotifyRoutineEx(WinternalProcNotify, TRUE);
@@ -2700,6 +3033,780 @@ static VOID WinternalUninstallNtTermHook(VOID)
     g_NtTermOriginal      = NULL;
     g_NtTermPrologSize    = 0;
     g_NtTermHookInstalled = FALSE;
+}
+
+// -----------------------------------------------------------------------------
+// NtUserDestroyWindow prologue hook -- driver-side enforcement of `win rule`
+// with action = block-destroy.
+//
+// The function lives in win32kfull.sys (Win11 24H2; some older builds: win32k.sys).
+// It IS exported by name despite not appearing in the standard export-rank list
+// IDA shows -- ordinal 1592 on this build. Resolution is therefore a PE export
+// walk via Klua_ResolveExportInModule once we have the module base.
+//
+// Detour matches the CALLER's PID / image (not the target HWND's properties --
+// that would require walking win32k internals to resolve the HWND, which is
+// fragile and version-dependent). Rules with kind = pid or image and action =
+// block-destroy fire here; title/class rules continue to be the user-mode
+// shield DLL's job.
+//
+// HVCI: the inline write is on a win32k code page. Same CR0.WP-toggle path that
+// fails for NtTerminateProcess on HVCI machines -- caller falls back to the
+// shield DLL (which subclasses target windows to drop WM_CLOSE; doesn't
+// help against a direct NtUserDestroyWindow call but covers the common
+// Task-Manager / WM_CLOSE attack surface).
+// -----------------------------------------------------------------------------
+
+static PVOID Klua_ResolveExportInModule(PVOID base, const char* name);
+
+typedef BOOLEAN (NTAPI *PFN_NT_USER_DESTROY_WINDOW)(_In_ HANDLE Hwnd);
+
+static PVOID  g_DestroyWinTarget       = NULL;
+static PUCHAR g_DestroyWinTrampoline   = NULL;
+static PFN_NT_USER_DESTROY_WINDOW g_DestroyWinOriginal = NULL;
+static UCHAR  g_DestroyWinSavedProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+static ULONG  g_DestroyWinPrologSize   = 0;
+static BOOLEAN g_DestroyWinHookInstalled = FALSE;
+
+// Cache the caller's image basename (lowered) so the rule loop doesn't
+// SeLocateProcessImageName-alloc on every NtUserDestroyWindow call. Keyed
+// by EPROCESS pointer; a process's image never changes, so the cache is
+// valid for that process's lifetime.
+typedef struct _WN_CALLER_IMAGE_CACHE {
+    PEPROCESS Process;
+    WCHAR     Basename[64];
+    USHORT    Len;
+} WN_CALLER_IMAGE_CACHE;
+
+#define WN_CALLER_IMAGE_CACHE_SIZE 32
+static WN_CALLER_IMAGE_CACHE g_CallerImgCache[WN_CALLER_IMAGE_CACHE_SIZE];
+static KSPIN_LOCK g_CallerImgLock;
+static BOOLEAN g_CallerImgLockInit = FALSE;
+
+static VOID WinternalGetCallerImageBasename(WCHAR* out, USHORT cap, USHORT* outLen)
+{
+    *outLen = 0;
+    if (!g_CallerImgLockInit) {
+        KeInitializeSpinLock(&g_CallerImgLock);
+        g_CallerImgLockInit = TRUE;
+    }
+    PEPROCESS proc = PsGetCurrentProcess();
+    ULONG slot = ((ULONG_PTR)proc >> 5) % WN_CALLER_IMAGE_CACHE_SIZE;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_CallerImgLock, &irql);
+    if (g_CallerImgCache[slot].Process == proc && g_CallerImgCache[slot].Len > 0) {
+        USHORT n = g_CallerImgCache[slot].Len;
+        if (n > cap - 1) n = cap - 1;
+        RtlCopyMemory(out, g_CallerImgCache[slot].Basename, n * sizeof(WCHAR));
+        out[n] = 0;
+        *outLen = n;
+        KeReleaseSpinLock(&g_CallerImgLock, irql);
+        return;
+    }
+    KeReleaseSpinLock(&g_CallerImgLock, irql);
+
+    PUNICODE_STRING img = NULL;
+    if (!NT_SUCCESS(SeLocateProcessImageName(proc, &img)) || !img || !img->Buffer) {
+        return;
+    }
+    // Trim to basename (after last \).
+    USHORT total = img->Length / sizeof(WCHAR);
+    USHORT baseStart = 0;
+    for (USHORT i = 0; i < total; ++i) {
+        if (img->Buffer[i] == L'\\' || img->Buffer[i] == L'/') baseStart = i + 1;
+    }
+    USHORT baseLen = total - baseStart;
+    if (baseLen >= cap) baseLen = cap - 1;
+    RtlCopyMemory(out, img->Buffer + baseStart, baseLen * sizeof(WCHAR));
+    out[baseLen] = 0;
+    *outLen = baseLen;
+
+    KeAcquireSpinLock(&g_CallerImgLock, &irql);
+    g_CallerImgCache[slot].Process = proc;
+    USHORT cn = baseLen;
+    if (cn >= (USHORT)RTL_NUMBER_OF(g_CallerImgCache[slot].Basename)) cn = RTL_NUMBER_OF(g_CallerImgCache[slot].Basename) - 1;
+    RtlCopyMemory(g_CallerImgCache[slot].Basename, out, cn * sizeof(WCHAR));
+    g_CallerImgCache[slot].Basename[cn] = 0;
+    g_CallerImgCache[slot].Len = cn;
+    KeReleaseSpinLock(&g_CallerImgLock, irql);
+
+    ExFreePool(img);
+}
+
+// Iterate win-rule list; return TRUE if any rule with action=block-destroy
+// matches the calling thread's PID or image basename. Bumps HitCount on
+// match so `win rule list` shows enforcement counts.
+static BOOLEAN WinternalCallerMatchesDestroyRule(VOID)
+{
+    if (!g_WinRuleSpinInit || g_WinRuleCount == 0) return FALSE;
+    UINT32 callerPid = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+    WCHAR  basename[64] = {0};
+    USHORT baseLen = 0;
+    BOOLEAN haveImage = FALSE;
+
+    BOOLEAN matched = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+    for (ULONG i = 0; i < g_WinRuleCount; ++i) {
+        WN_WIN_RULE_LIVE* r = &g_WinRules[i];
+        if (r->Action != WINTERNAL_WIN_ACT_BLOCK_DESTROY) continue;
+
+        if (r->Kind == WINTERNAL_WIN_KIND_PID) {
+            // Parse decimal pattern -> PID compare.
+            UINT32 want = 0;
+            for (USHORT k = 0; k < r->PatternLen; ++k) {
+                WCHAR c = r->Pattern[k];
+                if (c < L'0' || c > L'9') { want = 0; break; }
+                want = want * 10 + (UINT32)(c - L'0');
+            }
+            if (want != 0 && want == callerPid) {
+                r->HitCount++;
+                matched = TRUE;
+                break;
+            }
+        } else if (r->Kind == WINTERNAL_WIN_KIND_IMAGE_GLOB) {
+            // Resolve basename lazily so we don't pay for it when no rule needs it.
+            if (!haveImage) {
+                // Release lock during SeLocateProcessImageName (allocates).
+                KeReleaseSpinLock(&g_WinRuleSpin, irql);
+                WinternalGetCallerImageBasename(basename, RTL_NUMBER_OF(basename), &baseLen);
+                haveImage = TRUE;
+                KeAcquireSpinLock(&g_WinRuleSpin, &irql);
+                // Re-check rule still valid (could have been cleared while we let go).
+                if (i >= g_WinRuleCount) break;
+                r = &g_WinRules[i];
+                if (r->Action != WINTERNAL_WIN_ACT_BLOCK_DESTROY) continue;
+            }
+            if (baseLen > 0 &&
+                WinternalMatchWildcard(r->Pattern, r->PatternLen, basename, baseLen)) {
+                r->HitCount++;
+                matched = TRUE;
+                break;
+            }
+        }
+        // title/class rules are not enforced kernel-side (need win32k walk).
+    }
+    KeReleaseSpinLock(&g_WinRuleSpin, irql);
+    return matched;
+}
+
+static BOOLEAN NTAPI WinternalNtUserDestroyWindow_Detour(_In_ HANDLE Hwnd)
+{
+    if (WinternalCallerMatchesDestroyRule()) {
+        AuditAppend(IOCTL_WINTERNAL_WIN_RULE_ADD,
+                    (UINT64)(ULONG_PTR)Hwnd,
+                    (UINT32)(ULONG_PTR)PsGetCurrentProcessId(),
+                    STATUS_ACCESS_DENIED);
+        // FALSE return == DestroyWindow failed. Caller gets nothing back
+        // via GetLastError because we're in the win32k Nt-stub; the
+        // user-mode user32 wrapper translates the return.
+        return FALSE;
+    }
+    return g_DestroyWinOriginal ? g_DestroyWinOriginal(Hwnd) : FALSE;
+}
+
+// ----- minimal x64 length disassembler -------------------------------------
+//
+// Just enough to walk common kernel-function prologues to a clean
+// instruction boundary >= JMP_SIZE bytes. The naive `prolog = JMP_SIZE`
+// approach corrupts hooks whose first 14 bytes end mid-instruction, and
+// for `call qword [rip+imm32]` (FF 15 imm32) the copied bytes also need
+// RIP-relative rewrite because they end up at a different VA in the
+// trampoline pool. Both are handled here.
+//
+// Returns the length of the instruction at p, or 0 on unknown opcode.
+// Callers that hit 0 must refuse the install rather than write a hook
+// they can't safely uninstall.
+//
+// Handles the legal-prefix permutations we see in real kernel prologues:
+//   - segment overrides (2E/36/3E/26/64/65). On x64 CS/SS/DS/ES are
+//     largely ignored, but compilers still emit `2E` as a branch-hint
+//     prefix on indirect calls (`2E FF 15 imm32`, 7 bytes total). This
+//     is exactly what tripped up the NtUserDestroyWindow hook -- without
+//     this branch, the LDE returned 0 on the call and the install bailed.
+//   - operand-size (66) and address-size (67) prefixes
+//   - REX (40-4F)
+static ULONG WinternalInstrLen(const UCHAR* p)
+{
+    ULONG prefix = 0;
+    // Legacy prefixes -- may stack in any order, max 4 in practice.
+    while (prefix < 8) {
+        UCHAR c = p[0];
+        if (c == 0x2E || c == 0x36 || c == 0x3E || c == 0x26 ||
+            c == 0x64 || c == 0x65 ||
+            c == 0x66 || c == 0x67 ||
+            c == 0xF0 || c == 0xF2 || c == 0xF3) {
+            prefix++; p++;
+        } else {
+            break;
+        }
+    }
+    ULONG rex = 0;
+    if ((p[0] & 0xF0) == 0x40) { rex = 1; p++; }
+
+    UCHAR op = p[0];
+    ULONG len = 0;
+
+    // `len` here is the post-prefix / post-REX instruction length. The
+    // total returned at the bottom adds `prefix + rex` back in.
+    if (op >= 0x50 && op <= 0x5F)              len = 1;                   // push/pop r
+    else if (op == 0x90)                        len = 1;                   // nop
+    else if (op == 0xC3 || op == 0xCC)          len = 1;                   // ret / int3
+    else if (op == 0x33 || op == 0x31)          len = 2;                   // xor reg, reg     (op + modrm)
+    else if (op == 0x89 || op == 0x8B) {
+        // mov r/m64, r64  /  mov r64, r/m64. Decode the full ModRM
+        // addressing mode -- assuming reg-direct (mod=11) was the bug
+        // that turned `mov r10, [rip+disp32]` (encoding 4C 8B 15 disp32,
+        // 7 bytes) into a phantom 3-byte instruction. The trampoline
+        // would then copy only 3 bytes of a 7-byte instruction; the JMP
+        // we wrote at the truncated offset slid into the middle of the
+        // real disp32, the CPU read 4 bytes of the JMP opcode as the
+        // mov's displacement, and the resulting `[rip+0x000025FF]` ran
+        // straight into freed pool. Always decode the full mod/rm/sib
+        // here.
+        UCHAR modrm = p[1];
+        UCHAR mod   = (modrm >> 6) & 3;
+        UCHAR rm    = modrm & 7;
+        len = 2; // op + modrm
+        if (mod != 3) {
+            if (rm == 4) {
+                // SIB byte follows.
+                UCHAR sib  = p[2];
+                UCHAR base = sib & 7;
+                len += 1;
+                if (mod == 0 && base == 5) len += 4;   // disp32 (no base reg)
+                else if (mod == 1)         len += 1;    // disp8
+                else if (mod == 2)         len += 4;    // disp32
+            } else if (mod == 0 && rm == 5) {
+                len += 4;                                // [rip+disp32]
+            } else if (mod == 1) {
+                len += 1;                                // disp8
+            } else if (mod == 2) {
+                len += 4;                                // disp32
+            }
+        }
+    }
+    else if (op == 0xEB)                        len = 2;                   // jmp rel8         (op + disp8)
+    else if (op == 0xE9 || op == 0xE8)          len = 5;                   // jmp/call rel32   (op + imm32)
+    else if (op == 0x83 && p[1] == 0xEC)        len = 3;                   // sub rsp, imm8    (op + modrm + imm8)
+    else if (op == 0x81 && p[1] == 0xEC)        len = 6;                   // sub rsp, imm32   (op + modrm + imm32)
+    else if (op == 0xFF && (p[1] & 0x38) == 0x10) len = 6;                 // call qword [rip+imm32]
+    else if (op == 0xFF && (p[1] & 0x38) == 0x20) len = 6;                 // jmp qword [rip+imm32]
+    else if (op >= 0xB8 && op <= 0xBF)          len = rex ? 9 : 5;         // mov reg, imm32/64 (op + imm32 or imm64)
+    else if (op == 0x0F && p[1] == 0x1F) {
+        // multi-byte NOP. Length depends on ModRM/SIB/disp.
+        UCHAR modrm = p[2];
+        UCHAR mod   = (modrm >> 6) & 3;
+        UCHAR rm    = modrm & 7;
+        len = 3;
+        if (mod == 1) len = 4 + (rm == 4 ? 1 : 0);                          // disp8 [+SIB]
+        else if (mod == 2) len = 7 + (rm == 4 ? 1 : 0);                     // disp32 [+SIB]
+        else if (rm == 4)  len = 4;                                         // [SIB]
+    }
+
+    return prefix + rex + len;
+}
+
+// Walk forward from `code` until cumulative length >= minBytes, return the
+// total. 0 = parse failure (refuse hook). maxBytes caps the search so a
+// runaway prologue can't overrun our prolog buffer.
+static ULONG WinternalFindPrologBoundary(const UCHAR* code, ULONG minBytes, ULONG maxBytes)
+{
+    ULONG off = 0;
+    while (off < minBytes && off < maxBytes) {
+        ULONG l = WinternalInstrLen(code + off);
+        if (!l) return 0;
+        off += l;
+    }
+    return (off >= minBytes && off <= maxBytes) ? off : 0;
+}
+
+// Patch RIP-relative addressing inside a freshly-copied prologue so the
+// copied instructions still resolve to the same effective targets from
+// the trampoline's VA. Currently handles:
+//   - FF 15 imm32 -- call qword [rip+imm32]
+//   - FF 25 imm32 -- jmp  qword [rip+imm32]
+//   - 8B /5 imm32 -- mov r64, [rip+imm32]    (modrm mod=00 rm=101)
+//   - 89 /5 imm32 -- mov [rip+imm32], r64
+//
+// Strategy:
+//   1. Try direct relocation: rewrite disp32 so (newRipAfter + newDisp)
+//      lands at the same absolute address as (origRipAfter + oldDisp).
+//      Works only when |delta| <= 2GB.
+//   2. If the trampoline pool is too far from the target (modern Win11
+//      KASLR puts non-paged pool ~27TB away from win32kfull.sys, so
+//      step 1 always loses there), snapshot the 8 bytes the original
+//      instruction would have referenced into a data slot at the tail
+//      of the trampoline pool, then rewrite disp32 to point at that
+//      slot. Validates by reading from the original VA at install time
+//      (in the attached win32k-mapped process, so the read is safe).
+//      This preserves semantics for stable references (IAT entries,
+//      __security_cookie, CFG dispatch tables) -- not for live state
+//      that might change after install.
+//
+// Trampoline layout after this returns:
+//   [tramp .. tramp+prologSize-1]                    copied prolog
+//   [tramp+prologSize .. +prologSize+JMP_SIZE-1]     JMP-abs back to target+prolog
+//   [tramp+prologSize+JMP_SIZE ..]                   8-byte data slots (one per
+//                                                    indirected RIP-rel ref)
+static NTSTATUS WinternalPatchTrampolineRipRel(UCHAR* tramp, PVOID origBase, ULONG prologSize)
+{
+    ULONG dataSlotsBase = prologSize + WINTERNAL_KHOOK_JMP_SIZE;
+    ULONG slotsUsed     = 0;
+
+    ULONG off = 0;
+    while (off < prologSize) {
+        ULONG l = WinternalInstrLen(tramp + off);
+        if (!l) return STATUS_NOT_SUPPORTED;
+
+        UCHAR* p = tramp + off;
+        ULONG  pfx = 0;
+        while (pfx < 8) {
+            UCHAR c = p[0];
+            if (c == 0x2E || c == 0x36 || c == 0x3E || c == 0x26 ||
+                c == 0x64 || c == 0x65 ||
+                c == 0x66 || c == 0x67 ||
+                c == 0xF0 || c == 0xF2 || c == 0xF3) {
+                pfx++; p++;
+            } else {
+                break;
+            }
+        }
+        ULONG rex = 0;
+        if ((p[0] & 0xF0) == 0x40) { rex = 1; p++; }
+
+        BOOLEAN isRipRel = FALSE;
+        if (p[0] == 0xFF && ((p[1] & 0x38) == 0x10 || (p[1] & 0x38) == 0x20)) {
+            isRipRel = TRUE;   // call/jmp qword [rip+disp32]
+        } else if ((p[0] == 0x8B || p[0] == 0x89) && (p[1] & 0xC7) == 0x05) {
+            isRipRel = TRUE;   // mov r/m64, r64 / mov r64, r/m64 with [rip+disp32]
+        }
+
+        if (isRipRel) {
+            // For all currently-handled forms the layout post-prefix is
+            // opcode(1) + modrm(1) + disp32(4) = 6 bytes; total instruction
+            // length is pfx + rex + 6. The disp32 sits at p + 2.
+            ULONG totalLen = pfx + rex + 6;
+            INT32 oldOff   = *(INT32*)(p + 2);
+            ULONGLONG origAfter = (ULONGLONG)origBase + (off + totalLen);
+            ULONGLONG origEA    = origAfter + (LONGLONG)oldOff;
+            ULONGLONG newAfter  = (ULONGLONG)tramp + off + totalLen;
+            LONGLONG  delta     = (LONGLONG)origEA - (LONGLONG)newAfter;
+
+            if (delta >= -0x80000000LL && delta <= 0x7FFFFFFFLL) {
+                // Step 1: trampoline is within 2GB of the target -- direct
+                // relocation works.
+                *(INT32*)(p + 2) = (INT32)delta;
+                DLOG("RipRel: instr@+0x%X direct delta=0x%llX (origEA=%p)",
+                     off, (ULONGLONG)delta, (PVOID)origEA);
+            } else {
+                // Step 2: snapshot through a data slot. We need 8 bytes of
+                // slot space for each indirected reference.
+                ULONG slotOff = dataSlotsBase + slotsUsed * 8;
+                if (slotOff + 8 > WINTERNAL_KHOOK_TRAMP_SIZE) {
+                    DLOG("RipRel: instr@+0x%X out of slot space (used=%u)", off, slotsUsed);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                UCHAR* slot = tramp + slotOff;
+                __try {
+                    RtlCopyMemory(slot, (PVOID)origEA, 8);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    DLOG("RipRel: instr@+0x%X snapshot read of %p faulted 0x%08X",
+                         off, (PVOID)origEA, GetExceptionCode());
+                    return STATUS_NOT_SUPPORTED;
+                }
+                LONGLONG slotDelta = (LONGLONG)slot - (LONGLONG)newAfter;
+                if (slotDelta < -0x80000000LL || slotDelta > 0x7FFFFFFFLL) {
+                    // Cannot happen in practice -- slot is in the same
+                    // pool allocation as the instruction -- but keep the
+                    // bound check so future layout changes can't silently
+                    // break us.
+                    return STATUS_NOT_SUPPORTED;
+                }
+                *(INT32*)(p + 2) = (INT32)slotDelta;
+                slotsUsed++;
+                DLOG("RipRel: instr@+0x%X indirected via slot %u (origEA=%p value=%p slotDelta=0x%X)",
+                     off, slotsUsed - 1, (PVOID)origEA, *(PVOID*)slot, (UINT32)slotDelta);
+            }
+        }
+        off += l;
+    }
+    return STATUS_SUCCESS;
+}
+
+// win32kfull.sys is a session driver. SystemModuleInformation reports its
+// image base as a session-space VA, but that VA only has a backing PTE in
+// processes that have actually mapped the win32k subsystem -- i.e. ones
+// that have issued at least one USER syscall via win32u.dll. winternal.exe
+// is a console app and typically has not, so reads/writes against the
+// reported base from the IOCTL caller's context fault on a kernel address
+// with no PTE: PAGE_FAULT_IN_NON_PAGED_AREA. SEH does NOT catch that --
+// it goes straight to KeBugCheck. Fix is to attach to a process that has
+// win32k mapped at the EXACT VA we're about to touch.
+//
+// PsGetProcessWin32Process() != NULL is necessary but not sufficient on
+// Hyper-V VMs: Session 0 helper processes may have a W32THREADINFO
+// allocated (so the predicate returns non-NULL) without win32kfull.sys
+// being mapped at the same image base used by the interactive session.
+// So we iterate candidates and, if ProbeAddress is supplied, attach +
+// MmIsAddressValid-probe each one until one matches; only then return
+// it as a successful attach.
+static NTSTATUS WinternalAttachWin32kSession(_Out_ PEPROCESS* OutProc,
+                                             _Out_ WN_KAPC_STATE* Apc,
+                                             _In_opt_ PVOID ProbeAddress)
+{
+    *OutProc = NULL;
+
+    SIZE_T bufSize = 256 * 1024;
+    PVOID scratch = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufSize,
+                                    WINTERNAL_POOL_TAG_DEFAULT);
+    if (!scratch) {
+        DLOG("attach: ExAllocatePool2(scratch %llu) failed", (ULONGLONG)bufSize);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    NTSTATUS s = STATUS_INFO_LENGTH_MISMATCH;
+    for (int attempt = 0; attempt < 8 && s == STATUS_INFO_LENGTH_MISMATCH; ++attempt) {
+        ULONG ret = 0;
+        s = ZwQuerySystemInformation(SystemProcessInformation, scratch,
+                                     (ULONG)bufSize, &ret);
+        if (s == STATUS_INFO_LENGTH_MISMATCH) {
+            ExFreePoolWithTag(scratch, WINTERNAL_POOL_TAG_DEFAULT);
+            scratch = NULL;
+            bufSize *= 2;
+            if (bufSize > 16ull * 1024 * 1024) {
+                DLOG("attach: SystemProcessInformation > 16MB, giving up");
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            scratch = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufSize,
+                                      WINTERNAL_POOL_TAG_DEFAULT);
+            if (!scratch) {
+                DLOG("attach: ExAllocatePool2(scratch %llu retry) failed", (ULONGLONG)bufSize);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+    }
+    if (!NT_SUCCESS(s)) {
+        DLOG("attach: ZwQuerySystemInformation(SystemProcessInformation) -> 0x%08X", s);
+        if (scratch) ExFreePoolWithTag(scratch, WINTERNAL_POOL_TAG_DEFAULT);
+        return s;
+    }
+
+    ULONG considered = 0, win32kCandidates = 0, probedSucceed = 0, probedReject = 0;
+    PEPROCESS chosen = NULL;
+    PUCHAR p = (PUCHAR)scratch;
+    for (;;) {
+        ULONG nextOffset  = *(PULONG)(p + 0x00);
+        ULONG_PTR uniqPid = *(PULONG_PTR)(p + 0x50);
+        UINT32 pid = (UINT32)uniqPid;
+        considered++;
+        // Skip Idle (0) and System (4) -- neither maps win32k.
+        if (pid > 4) {
+            PEPROCESS proc = NULL;
+            if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc))) {
+                if (PsGetProcessWin32Process(proc) != NULL) {
+                    win32kCandidates++;
+                    if (ProbeAddress) {
+                        // Attach, probe the exact VA the caller is about
+                        // to touch. If it's not mapped here either, this
+                        // process's session has win32k bookkeeping but
+                        // not the specific module we need; detach and
+                        // keep looking.
+                        KeStackAttachProcess(proc, Apc);
+                        BOOLEAN valid = MmIsAddressValid(ProbeAddress);
+                        if (valid) {
+                            UCHAR* sn = PsGetProcessImageFileName(proc);
+                            DLOG("attach: pid=%u image='%s' probe=%p VALID -> using",
+                                 pid, sn ? (const char*)sn : "?", ProbeAddress);
+                            *OutProc = proc;
+                            probedSucceed++;
+                            ExFreePoolWithTag(scratch, WINTERNAL_POOL_TAG_DEFAULT);
+                            return STATUS_SUCCESS;
+                        }
+                        KeUnstackDetachProcess(Apc);
+                        probedReject++;
+                    } else {
+                        // No probe requested -- first GUI process wins.
+                        chosen = proc;
+                        break;
+                    }
+                }
+                ObDereferenceObject(proc);
+            }
+        }
+        if (nextOffset == 0) break;
+        p += nextOffset;
+    }
+    ExFreePoolWithTag(scratch, WINTERNAL_POOL_TAG_DEFAULT);
+
+    if (chosen) {
+        UCHAR* sn = PsGetProcessImageFileName(chosen);
+        DLOG("attach: pid=%lu image='%s' (no probe) -> using",
+             (ULONG)(ULONG_PTR)PsGetProcessId(chosen), sn ? (const char*)sn : "?");
+        KeStackAttachProcess(chosen, Apc);
+        *OutProc = chosen;
+        return STATUS_SUCCESS;
+    }
+    DLOG("attach: no suitable process found "
+         "(considered=%u, w32candidates=%u, probeOk=%u, probeBad=%u, probeAddr=%p)",
+         considered, win32kCandidates, probedSucceed, probedReject, ProbeAddress);
+    return STATUS_NOT_FOUND;
+}
+
+static VOID WinternalDetachWin32kSession(_In_ PEPROCESS Proc, _In_ WN_KAPC_STATE* Apc)
+{
+    KeUnstackDetachProcess(Apc);
+    ObDereferenceObject(Proc);
+}
+
+// Install the NtUserDestroyWindow inline hook at a *specific* target VA.
+// Split out so the IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA handler can hand
+// us an address resolved via PDB on the CLI side -- letting us hit non-
+// exported workers, and staying robust across Windows builds where the
+// export table walk wouldn't help.
+static NTSTATUS WinternalInstallDestroyWindowHookAt(PVOID target)
+{
+    DLOG("InstallAt: enter target=%p (already installed=%u, irql=%u)",
+         target, g_DestroyWinHookInstalled, KeGetCurrentIrql());
+    if (g_DestroyWinHookInstalled) return STATUS_SUCCESS;
+    if (!target) return STATUS_INVALID_PARAMETER;
+
+    // Borrow a process whose session has the EXACT target VA mapped.
+    // Helper attaches, probes target with MmIsAddressValid, retries
+    // candidates if the first ones don't have win32kfull at the same
+    // base. This is mandatory: SEH cannot catch PAGE_FAULT_IN_NON_PAGED_AREA.
+    PEPROCESS guiProc = NULL;
+    WN_KAPC_STATE apc;
+    NTSTATUS attachStatus = WinternalAttachWin32kSession(&guiProc, &apc, target);
+    if (!NT_SUCCESS(attachStatus)) {
+        DLOG("InstallAt: attach failed 0x%08X -- refusing rather than fault", attachStatus);
+        return attachStatus;
+    }
+
+    // Belt-and-suspenders. AttachWin32kSession only returns SUCCESS after
+    // confirming MmIsAddressValid(target), but page state can shift in
+    // theory between the helper's probe and the read below.
+    if (!MmIsAddressValid(target)) {
+        DLOG("InstallAt: target=%p invalidated after attach (race?) -- aborting", target);
+        WinternalDetachWin32kSession(guiProc, &apc);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    // The first 14 bytes of NtUserDestroyWindow end mid-instruction inside
+    // `call qword [rip+__imp_EnterCrit]` on Win11 24H2; copying those bytes
+    // naively into the trampoline corrupts the call. Find the first clean
+    // instruction boundary >= JMP_SIZE bytes so the trampoline holds whole
+    // instructions only.
+    ULONG prolog = WinternalFindPrologBoundary(
+        (const UCHAR*)target, WINTERNAL_KHOOK_JMP_SIZE, WINTERNAL_KHOOK_MAX_PROLOG);
+    DLOG("InstallAt: prolog boundary = %u (target[0..3]=%02X %02X %02X %02X)",
+         prolog,
+         ((UCHAR*)target)[0], ((UCHAR*)target)[1],
+         ((UCHAR*)target)[2], ((UCHAR*)target)[3]);
+    if (!prolog) {
+        // Unknown opcode in the first 64 bytes -- refuse rather than ship a
+        // broken hook. Bumping the LDE's opcode table is the fix.
+        WinternalDetachWin32kSession(guiProc, &apc);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    PUCHAR tramp = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE,
+                                           WINTERNAL_KHOOK_TRAMP_SIZE,
+                                           WINTERNAL_POOL_TAG_DEFAULT);
+    if (!tramp) {
+        DLOG("InstallAt: trampoline pool alloc failed");
+        WinternalDetachWin32kSession(guiProc, &apc);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    DLOG("InstallAt: trampoline=%p (NX off, system VA)", tramp);
+
+    UCHAR newProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+    NTSTATUS status;
+    __try {
+        RtlCopyMemory(g_DestroyWinSavedProlog, target, prolog);
+        RtlCopyMemory(tramp, target, prolog);
+        // Rewrite RIP-relative addressing in the copied bytes so they still
+        // resolve to the same VAs when run from the trampoline.
+        status = WinternalPatchTrampolineRipRel(tramp, target, prolog);
+        if (NT_SUCCESS(status)) {
+            KhookWriteJmpAbs(tramp + prolog, (PUCHAR)target + prolog);
+            KhookWriteJmpAbs(newProlog, (PVOID)(ULONG_PTR)WinternalNtUserDestroyWindow_Detour);
+            // Pad bytes past the JMP with NOPs. WinternalProtectWriteCode
+            // writes the full `prolog` count, so leaving 14..prolog-1
+            // uninitialized stamps stack garbage into win32k code -- harmless
+            // while the JMP at offset 0 keeps control out of those bytes,
+            // but a real hazard if anything ever lands there (debugger
+            // single-step, exception unwind, future re-entry).
+            for (ULONG i = WINTERNAL_KHOOK_JMP_SIZE; i < prolog; ++i) newProlog[i] = 0x90;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    DLOG("InstallAt: trampoline build status=0x%08X", status);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        WinternalDetachWin32kSession(guiProc, &apc);
+        return status;
+    }
+    DLOG("InstallAt: about to ProtectWriteCode at target=%p len=%u", target, prolog);
+    __try {
+        status = WinternalProtectWriteCode(target, newProlog, prolog);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
+    DLOG("InstallAt: ProtectWriteCode -> 0x%08X", status);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        WinternalDetachWin32kSession(guiProc, &apc);
+        return status;
+    }
+    g_DestroyWinTarget        = target;
+    g_DestroyWinTrampoline    = tramp;
+    g_DestroyWinOriginal      = (PFN_NT_USER_DESTROY_WINDOW)tramp;
+    g_DestroyWinPrologSize    = prolog;
+    g_DestroyWinHookInstalled = TRUE;
+    WinternalDetachWin32kSession(guiProc, &apc);
+    DLOG("InstallAt: SUCCESS target=%p tramp=%p prolog=%u", target, tramp, prolog);
+    return STATUS_SUCCESS;
+}
+
+// Export-table fallback: walk loaded modules, find win32kfull.sys, resolve
+// NtUserDestroyWindow by name, then call the AtVA helper. Used when the
+// CLI didn't pre-resolve via PDB (no network, dbghelp missing, etc.).
+static NTSTATUS WinternalInstallDestroyWindowHook(VOID)
+{
+    DLOG("InstallExport: enter (already installed=%u)", g_DestroyWinHookInstalled);
+    if (g_DestroyWinHookInstalled) return STATUS_SUCCESS;
+
+    PRTL_PROCESS_MODULES mods = QueryAllModules();
+    if (!mods) {
+        DLOG("InstallExport: QueryAllModules returned NULL");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    PVOID win32kFull = NULL;
+    ULONG win32kFullSize = 0;
+    for (ULONG i = 0; i < mods->NumberOfModules; ++i) {
+        const char* full = (const char*)mods->Modules[i].FullPathName;
+        const char* base = full + mods->Modules[i].OffsetToFileName;
+        if (_stricmp(base, "win32kfull.sys") == 0) {
+            win32kFull = mods->Modules[i].ImageBase;
+            win32kFullSize = mods->Modules[i].ImageSize;
+            break;
+        }
+    }
+    ExFreePoolWithTag(mods, WINTERNAL_POOL_TAG_DEFAULT);
+    if (!win32kFull) {
+        DLOG("InstallExport: win32kfull.sys not in module list");
+        return STATUS_NOT_FOUND;
+    }
+    DLOG("InstallExport: win32kfull base=%p size=0x%X", win32kFull, win32kFullSize);
+
+    // Klua_ResolveExportInModule walks win32kFull's PE headers. Same
+    // session-space hazard as the install: must run attached to a process
+    // with win32k mapped or the PE header read PAGE_FAULTs. Probe the PE
+    // base via the helper so we pick a process that actually has it.
+    PEPROCESS guiProc = NULL;
+    WN_KAPC_STATE apc;
+    NTSTATUS attachStatus = WinternalAttachWin32kSession(&guiProc, &apc, win32kFull);
+    if (!NT_SUCCESS(attachStatus)) {
+        DLOG("InstallExport: attach failed 0x%08X (no session has win32kfull at %p)",
+             attachStatus, win32kFull);
+        return attachStatus;
+    }
+
+    PVOID target = Klua_ResolveExportInModule(win32kFull, "NtUserDestroyWindow");
+    WinternalDetachWin32kSession(guiProc, &apc);
+    DLOG("InstallExport: resolved NtUserDestroyWindow target=%p", target);
+    if (!target) return STATUS_PROCEDURE_NOT_FOUND;
+    // InstallAt re-attaches independently with the now-known target VA.
+    return WinternalInstallDestroyWindowHookAt(target);
+}
+
+// Resolve { moduleBaseName -> imageBase, imageSize } for kernel modules
+// loaded right now. Used by the by-RVA IOCTL to translate (Module, RVA)
+// from user-mode into an absolute VA, and to bounds-check the RVA.
+static NTSTATUS WinternalFindKernelModule(
+    _In_  PCWSTR  ModuleBaseNameW,
+    _Out_ PVOID*  OutBase,
+    _Out_ PULONG  OutSize)
+{
+    *OutBase = NULL;
+    *OutSize = 0;
+
+    // Module names from CLI are wide; the system module list is ANSI. Down-
+    // cast to a small ASCII buffer (filenames are ASCII in practice).
+    char nameA[64];
+    SIZE_T len = 0;
+    while (ModuleBaseNameW[len] && len < RTL_NUMBER_OF(nameA) - 1) {
+        WCHAR c = ModuleBaseNameW[len];
+        if (c > 0x7F) return STATUS_INVALID_PARAMETER;  // refuse non-ASCII
+        nameA[len] = (char)c;
+        ++len;
+    }
+    nameA[len] = 0;
+    if (len == 0) return STATUS_INVALID_PARAMETER;
+
+    PRTL_PROCESS_MODULES mods = QueryAllModules();
+    if (!mods) return STATUS_INSUFFICIENT_RESOURCES;
+
+    NTSTATUS status = STATUS_NOT_FOUND;
+    for (ULONG i = 0; i < mods->NumberOfModules; ++i) {
+        const char* full = (const char*)mods->Modules[i].FullPathName;
+        const char* base = full + mods->Modules[i].OffsetToFileName;
+        if (_stricmp(base, nameA) == 0) {
+            *OutBase = mods->Modules[i].ImageBase;
+            *OutSize = mods->Modules[i].ImageSize;
+            status = STATUS_SUCCESS;
+            break;
+        }
+    }
+    ExFreePoolWithTag(mods, WINTERNAL_POOL_TAG_DEFAULT);
+    return status;
+}
+
+// Dispatch table for HOOK_INSTALL_BY_RVA. Keep in sync with
+// WINTERNAL_HOOK_ID_* in Public.h.
+static NTSTATUS WinternalInstallHookByRva(
+    _In_  UINT32 HookId,
+    _In_  PVOID  TargetVa)
+{
+    switch (HookId) {
+        case WINTERNAL_HOOK_ID_DESTROY_WINDOW:
+            return WinternalInstallDestroyWindowHookAt(TargetVa);
+        default:
+            return STATUS_NOT_IMPLEMENTED;
+    }
+}
+
+static VOID WinternalUninstallDestroyWindowHook(VOID)
+{
+    DLOG("Uninstall: enter (installed=%u target=%p)",
+         g_DestroyWinHookInstalled, g_DestroyWinTarget);
+    if (!g_DestroyWinHookInstalled) return;
+    // Same session-space hazard as install: g_DestroyWinTarget is a
+    // win32kfull VA, so the writeback faults if the unload path runs in
+    // a thread without win32k mapped (e.g. the system unload thread).
+    // Skip the restore rather than crash if no GUI process is available.
+    PEPROCESS guiProc = NULL;
+    WN_KAPC_STATE apc;
+    NTSTATUS attachStatus = WinternalAttachWin32kSession(&guiProc, &apc, g_DestroyWinTarget);
+    if (NT_SUCCESS(attachStatus)) {
+        NTSTATUS ws = WinternalProtectWriteCode(g_DestroyWinTarget, g_DestroyWinSavedProlog, g_DestroyWinPrologSize);
+        DLOG("Uninstall: ProtectWriteCode restore -> 0x%08X", ws);
+        WinternalDetachWin32kSession(guiProc, &apc);
+    } else {
+        DLOG("Uninstall: attach failed 0x%08X -- skipping restore (target page unreachable)",
+             attachStatus);
+    }
+    if (g_DestroyWinTrampoline) {
+        ExFreePoolWithTag(g_DestroyWinTrampoline, WINTERNAL_POOL_TAG_DEFAULT);
+        g_DestroyWinTrampoline = NULL;
+    }
+    g_DestroyWinTarget        = NULL;
+    g_DestroyWinOriginal      = NULL;
+    g_DestroyWinPrologSize    = 0;
+    g_DestroyWinHookInstalled = FALSE;
 }
 
 // Lazy one-time registration. Altitude string is in the "free" altitude
@@ -3884,6 +4991,14 @@ static NTSTATUS HandleProcProtectAdd(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleProcProtectRemove(PVOID, size_t);
 static NTSTATUS HandleProcProtectList(PVOID, size_t, size_t*);
 static NTSTATUS HandleProcProtectClear(VOID);
+static NTSTATUS HandleWinRuleAdd(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleWinRuleRemove(PVOID, size_t);
+static NTSTATUS HandleWinRuleList(PVOID, size_t, size_t*);
+static NTSTATUS HandleWinRuleClear(VOID);
+static NTSTATUS HandleHookInstallByRva(PVOID, size_t, PVOID, size_t, size_t*);
+
+// (Forward decls for the win32k hook helpers + QueryAllModules already
+// live with the NtTerminateProcess decls earlier in the file.)
 static NTSTATUS HandleForceUnload(PVOID, size_t);
 static NTSTATUS HandleKdrvRegister(PVOID, size_t);
 static NTSTATUS HandleKdrvDeregister(PVOID, size_t);
@@ -5603,6 +6718,21 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
         break;
     case IOCTL_WINTERNAL_PROC_PROTECT_CLEAR:
         status = HandleProcProtectClear();
+        break;
+    case IOCTL_WINTERNAL_WIN_RULE_ADD:
+        status = HandleWinRuleAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_WIN_RULE_REMOVE:
+        status = HandleWinRuleRemove(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_WIN_RULE_LIST:
+        status = HandleWinRuleList(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_WIN_RULE_CLEAR:
+        status = HandleWinRuleClear();
+        break;
+    case IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA:
+        status = HandleHookInstallByRva(InBuf, InLen, OutBuf, OutLen, BytesWritten);
         break;
     case IOCTL_WINTERNAL_SELFPROTECT_SET:
         status = HandleSelfProtectSet(InBuf, InLen);

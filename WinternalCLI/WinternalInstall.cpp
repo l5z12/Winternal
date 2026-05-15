@@ -15,11 +15,15 @@
 #include <shlwapi.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <wincrypt.h>
+#include <ncrypt.h>
 #include <cstdio>
 #include <filesystem>
 #include <string>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ncrypt.lib")
 
 using namespace winternal;
 
@@ -151,6 +155,142 @@ static bool SetupMinifilterRegistry() {
     return true;
 }
 
+// -- Test-signing cert install / uninstall ----------------------------------
+//
+// The driver carries its own Authenticode signer cert embedded in the PE
+// (the WDK signs Winternal.sys with `WinternalTestCert` during build via
+// the project's GenerateTestCertificate/SubjectName entries). We pull
+// that cert straight out of the .sys via CryptQueryObject, then install
+// it into:
+//   - LocalMachine\TrustedPublisher  (the kernel loader checks this when
+//                                      sc start hands it a test-signed .sys)
+//   - LocalMachine\Root              (so the chain validates -- otherwise
+//                                      the verifier rejects "unknown issuer")
+//
+// No key generation, no PowerShell, no dependency on the build machine's
+// CurrentUser\My store. `winternal install` works against any test-signed
+// .sys -- ours by default, anyone else's via --path.
+
+// Extract the leaf signer cert from a PE's embedded Authenticode
+// signature. Returns a PCCERT_CONTEXT the caller must
+// CertFreeCertificateContext, or nullptr on any failure.
+PCCERT_CONTEXT ExtractSignerCertFromPe(const std::wstring& pePath) {
+    DWORD       encType = 0, contentType = 0, formatType = 0;
+    HCERTSTORE  certStore = nullptr;
+    HCRYPTMSG   msg       = nullptr;
+    if (!::CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE, pePath.c_str(),
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0, &encType, &contentType, &formatType,
+            &certStore, &msg, nullptr)) {
+        return nullptr;
+    }
+
+    // The signer info pairs (Issuer, SerialNumber) → exact cert in the
+    // attached PKCS7 cert store. CMSG_SIGNER_INFO_PARAM is the documented
+    // way; we only care about the FIRST signer (test-signed drivers
+    // don't dual-sign).
+    PCCERT_CONTEXT signer = nullptr;
+    DWORD siSize = 0;
+    if (::CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &siSize) && siSize > 0) {
+        std::vector<BYTE> siBuf(siSize);
+        if (::CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, siBuf.data(), &siSize)) {
+            auto* si = reinterpret_cast<CMSG_SIGNER_INFO*>(siBuf.data());
+            CERT_INFO key{};
+            key.Issuer       = si->Issuer;
+            key.SerialNumber = si->SerialNumber;
+            PCCERT_CONTEXT found = ::CertFindCertificateInStore(
+                certStore, X509_ASN_ENCODING, 0,
+                CERT_FIND_SUBJECT_CERT, &key, nullptr);
+            if (found) signer = ::CertDuplicateCertificateContext(found);
+        }
+    }
+    if (msg)       ::CryptMsgClose(msg);
+    if (certStore) ::CertCloseStore(certStore, 0);
+    return signer;
+}
+
+// Add the signer cert to LM\TrustedPublisher + LM\Root.
+bool InstallSysSignerCert(const std::wstring& sysPath) {
+    PCCERT_CONTEXT cert = ExtractSignerCertFromPe(sysPath);
+    if (!cert) {
+        fwprintf(stderr, L"install-cert: %ls has no embedded Authenticode signature (or extraction failed: %lu)\n",
+                 sysPath.c_str(), ::GetLastError());
+        return false;
+    }
+
+    // Human-friendly subject for logging.
+    wchar_t subj[256] = {0};
+    ::CertNameToStrW(X509_ASN_ENCODING, &cert->pCertInfo->Subject,
+                     CERT_X500_NAME_STR | CERT_NAME_STR_NO_PLUS_FLAG,
+                     subj, (DWORD)(sizeof(subj) / sizeof(subj[0])));
+
+    auto addTo = [&](LPCWSTR storeName) {
+        HCERTSTORE s = ::CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                        CERT_SYSTEM_STORE_LOCAL_MACHINE, storeName);
+        if (!s) return false;
+        bool ok = ::CertAddCertificateContextToStore(
+                    s, cert, CERT_STORE_ADD_REPLACE_EXISTING, nullptr) != 0;
+        ::CertCloseStore(s, 0);
+        return ok;
+    };
+    bool tpOk   = addTo(L"TrustedPublisher");
+    bool rootOk = addTo(L"ROOT");
+
+    ::CertFreeCertificateContext(cert);
+    if (!tpOk || !rootOk) {
+        fwprintf(stderr, L"install-cert: import failed -- TrustedPublisher=%d Root=%d\n",
+                 tpOk ? 1 : 0, rootOk ? 1 : 0);
+        return false;
+    }
+    wprintf(L"Cert: %ls -> LM\\TrustedPublisher + LM\\Root\n", subj);
+    return true;
+}
+
+// Remove every copy of the .sys's signer cert from LM\TrustedPublisher
+// and LM\Root. Match is by exact thumbprint (SHA1 hash of the encoded
+// cert), so we only delete our own entry -- not anything unrelated that
+// shares a subject.
+//
+// Pass the path to the still-installed .sys (uninstall calls this BEFORE
+// DeleteFile). If the file is gone we silently skip cert removal.
+void UninstallSysSignerCert(const std::wstring& sysPath) {
+    PCCERT_CONTEXT cert = ExtractSignerCertFromPe(sysPath);
+    if (!cert) return;
+
+    BYTE hash[20];   // SHA1
+    DWORD hashLen = sizeof(hash);
+    if (!::CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, hash, &hashLen)) {
+        ::CertFreeCertificateContext(cert);
+        return;
+    }
+    CRYPT_HASH_BLOB hb{ hashLen, hash };
+
+    int removed = 0;
+    auto scrub = [&](LPCWSTR storeName) {
+        HCERTSTORE s = ::CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                        CERT_SYSTEM_STORE_LOCAL_MACHINE, storeName);
+        if (!s) return;
+        for (;;) {
+            PCCERT_CONTEXT c = ::CertFindCertificateInStore(
+                s, X509_ASN_ENCODING, 0,
+                CERT_FIND_SHA1_HASH, &hb, nullptr);
+            if (!c) break;
+            // CertDeleteCertificateFromStore frees the context; the loop
+            // restarts with nullptr-cursor on the next pass.
+            if (!::CertDeleteCertificateFromStore(c)) break;
+            removed++;
+        }
+        ::CertCloseStore(s, 0);
+    };
+    scrub(L"TrustedPublisher");
+    scrub(L"ROOT");
+
+    ::CertFreeCertificateContext(cert);
+    if (removed > 0) wprintf(L"Cert: removed %d copy from system stores.\n", removed);
+}
+
 int CmdInstall(int argc, wchar_t** argv) {
     if (!IsAdmin()) {
         fwprintf(stderr, L"install: requires an elevated prompt (right-click -> Run as administrator).\n");
@@ -158,10 +298,13 @@ int CmdInstall(int argc, wchar_t** argv) {
     }
     const wchar_t* srcOverride = nullptr;
     bool autoStart = true;   // default: start the service after install
+    bool installCert = true; // default: also drop the test-signing cert in
+                             // CurrentUser\My + LocalMachine\{TrustedPublisher,Root}
     for (int i = 0; i < argc; ++i) {
         if (wcscmp(argv[i], L"--path") == 0 && i + 1 < argc) srcOverride = argv[++i];
         else if (wcscmp(argv[i], L"--start") == 0)    autoStart = true;   // legacy no-op
         else if (wcscmp(argv[i], L"--no-start") == 0) autoStart = false;
+        else if (wcscmp(argv[i], L"--no-cert") == 0)  installCert = false;
     }
 
     std::wstring src = ResolveSourceSys(srcOverride);
@@ -169,7 +312,62 @@ int CmdInstall(int argc, wchar_t** argv) {
         fwprintf(stderr, L"install: cannot find Winternal.sys (pass --path <full-path>).\n");
         return 1;
     }
+
+    // Cert first: extract the .sys's Authenticode signer and trust it in
+    // LocalMachine\TrustedPublisher + Root. The service start below would
+    // otherwise fail with ERROR_INVALID_IMAGE_HASH (577) before the user
+    // saw any cert-related error message. We do this against the SOURCE
+    // .sys (not the destination) so we can fail fast before any copy.
+    if (installCert) {
+        if (!InstallSysSignerCert(src)) {
+            fwprintf(stderr, L"install: cert install failed -- continuing, but the\n"
+                              L"  service start below will likely fail with 577 unless the\n"
+                              L"  driver's signer is already trusted. Re-run with --no-cert\n"
+                              L"  to suppress this step.\n");
+        }
+    }
+
     std::wstring dst = InstalledSysPath();
+
+    // If the service is already running, the .sys at `dst` is mapped and
+    // locked by the kernel -- CopyFile would fail with SHARING_VIOLATION,
+    // and even if it succeeded the in-memory copy wouldn't update. Always
+    // stop the service before copying so an `install` after a code change
+    // actually swaps the driver. The start below brings the new binary in.
+    {
+        SC_HANDLE preScm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (preScm) {
+            SC_HANDLE preSvc = ::OpenServiceW(preScm, kServiceName,
+                                                SERVICE_QUERY_STATUS | SERVICE_STOP);
+            if (preSvc) {
+                SERVICE_STATUS qst{};
+                if (::QueryServiceStatus(preSvc, &qst) &&
+                    qst.dwCurrentState != SERVICE_STOPPED &&
+                    qst.dwCurrentState != SERVICE_STOP_PENDING) {
+                    SERVICE_STATUS stopSt{};
+                    if (::ControlService(preSvc, SERVICE_CONTROL_STOP, &stopSt)) {
+                        wprintf(L"Service was running -- stopped to swap binary.\n");
+                        // Poll briefly for transition to STOPPED so the
+                        // kernel releases the file lock before we copy.
+                        for (int i = 0; i < 50; ++i) {
+                            ::QueryServiceStatus(preSvc, &stopSt);
+                            if (stopSt.dwCurrentState == SERVICE_STOPPED) break;
+                            ::Sleep(100);
+                        }
+                    } else {
+                        DWORD e = ::GetLastError();
+                        if (e != ERROR_SERVICE_NOT_ACTIVE) {
+                            fwprintf(stderr,
+                                L"install: WARN cannot stop running service (%lu); copy may fail.\n", e);
+                        }
+                    }
+                }
+                ::CloseServiceHandle(preSvc);
+            }
+            ::CloseServiceHandle(preScm);
+        }
+    }
+
     wprintf(L"Copy: %s\n   -> %s\n", src.c_str(), dst.c_str());
     if (!::CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
         fwprintf(stderr, L"install: copy failed (%lu).\n", ::GetLastError());
@@ -320,6 +518,12 @@ int CmdUninstall() {
     ::CloseServiceHandle(scm);
 
     std::wstring sys = InstalledSysPath();
+
+    // Pull the signer cert out BEFORE we delete the file -- we need its
+    // thumbprint to scrub the matching entries from LM\TrustedPublisher
+    // + LM\Root. Silent no-op if the file is gone or unsigned.
+    UninstallSysSignerCert(sys);
+
     if (::DeleteFileW(sys.c_str())) {
         wprintf(L"Removed %s\n", sys.c_str());
     } else if (::GetLastError() != ERROR_FILE_NOT_FOUND) {

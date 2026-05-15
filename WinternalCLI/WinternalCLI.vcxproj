@@ -48,7 +48,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ntdll.lib;iphlpapi.lib;ws2_32.lib;advapi32.lib;psapi.lib;crypt32.lib;shell32.lib;shlwapi.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ntdll.lib;iphlpapi.lib;ws2_32.lib;advapi32.lib;psapi.lib;crypt32.lib;shell32.lib;shlwapi.lib;user32.lib;dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -65,9 +65,11 @@
     <ClCompile Include="WinternalNtfs.cpp" />
     <ClCompile Include="WinternalPlugins.cpp" />
     <ClCompile Include="Hook64.cpp" />
+    <ClCompile Include="Symbols\SymbolResolver.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Hook64.h" />
+    <ClInclude Include="Symbols\SymbolResolver.h" />
   </ItemGroup>
   <!--
     Lua 5.4 sources, dropped in by tools/fetch-lua.ps1 on first build.

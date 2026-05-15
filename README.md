@@ -181,6 +181,8 @@ Windows (HWND operations -- all under `win`):
   win list [--pid N] [--title PAT] [--class PAT] [--visible]
   win info  <hwnd>                                full window info dump
   win close <hwnd>                                WM_CLOSE (polite, runs target's exit code)
+  win destroy <hwnd>                              DestroyWindow direct -- exercises the
+                                                  driver block-destroy hook
   win kill  <hwnd>                                WM_CLOSE + driver kkill if it survives
   win hide  <hwnd>    win show <hwnd>             ShowWindow(SW_HIDE|SW_SHOWNA)
   win front <hwnd>                                foreground with attach-input bypass
@@ -188,6 +190,16 @@ Windows (HWND operations -- all under `win`):
   win zbid <hwnd> [band 0..18]                    read/set the internal Z-band
   win privacy <hwnd> [none|monitor|hide]          display-affinity (anti-screen-cap)
   win move <hwnd> <x> <y> [w h]                   reposition (and optionally resize)
+  win protect [--stop]                            run / stop the user-mode guardian that
+                                                  enforces close/create rules via
+                                                  WH_CALLWNDPROC + WH_CBT
+  win rule add --action close|create|destroy      add a window rule (driver-resident);
+              ( --title PAT | --class PAT |       close/create are user-mode (need the
+                --pid N    | --image PAT )        guardian); destroy installs a kernel
+                                                  inline hook on NtUserDestroyWindow
+                                                  and is caller-based (--pid / --image
+                                                  only)
+  win rule list | remove <id> | clear
 
 Kernel primitives (admin + loaded Winternal.sys):
   kver | kpids
@@ -265,6 +277,66 @@ That handle never goes through `OpenProcess`, so no Ob pre-op fires. The only
 thing that could block self-termination is the inline hook, which HVCI is
 blocking. If you need that on HVCI, disable Memory Integrity (Windows Security
 → Device Security → Core Isolation), reboot, and re-add the rule.
+
+### `win rule` and the destroy-hook trampoline
+
+`win rule` has three actions, two enforcement layers, and one nontrivial
+trampoline-relocator the destroy path needs to run on stock Win11 26100:
+
+- `--action close` and `--action create` -- enforced by the **user-mode
+  shield DLL** (`WinternalWinShield.dll`) that the `win protect`
+  guardian injects into every GUI process via `SetWindowsHookEx`. close
+  drops `WM_CLOSE` / `WM_SYSCOMMAND(SC_CLOSE)` / `WM_QUERYENDSESSION`
+  via subclassing; create aborts `CreateWindowEx` via `WH_CBT`. Rules
+  live in the driver (so they survive across guardian restarts) and are
+  mirrored into a shared mapping the guardian polls by generation tick.
+- `--action destroy` -- enforced by a **driver-side inline hook** on
+  win32k's `NtUserDestroyWindow` syscall stub. Caller-based, so only
+  `--pid` and `--image` rule kinds apply (resolving HWND -> properties
+  would require walking win32k internals). The CLI pre-resolves the RVA
+  via DbgHelp + the Microsoft symbol server when available, so the
+  driver hits non-exported workers too; if that fails, the driver falls
+  back to its own export-table walk.
+
+Three things make the destroy hook fragile in ways the doc-equivalent
+`proc protect` hook isn't:
+
+1. **win32kfull.sys is a session driver.** Its image base reported by
+   `SystemModuleInformation` is a session-space VA that only has a
+   backing PTE in processes that have actually issued a USER syscall.
+   `winternal.exe` is a console app and typically hasn't, so a naive
+   read of the prologue from the IOCTL caller's context faults on a
+   kernel address with no PTE -- which is `PAGE_FAULT_IN_NON_PAGED_AREA`,
+   a bugcheck path SEH cannot catch. The driver fixes this by iterating
+   `SystemProcessInformation`, picking processes where
+   `PsGetProcessWin32Process != NULL`, and `KeStackAttach`-ing while
+   probing the target VA with `MmIsAddressValid` until one matches.
+2. **The prologue contains a RIP-relative `mov r10, [rip+disp32]`**
+   (almost certainly the `__security_cookie` / CFG dispatch table load
+   the compiler emits). The minimal length disassembler has to decode
+   the full ModRM/SIB encoding -- a "reg-direct only" simplification
+   undercounts this 7-byte instruction as 3, the prologue copy stops
+   mid-instruction, and the trampoline executes garbage that resolves
+   to freed pool. The fix is a proper ModRM decode for `8B/89` covering
+   all five addressing modes (reg-direct, RIP-rel, SIB, disp8, disp32).
+3. **Trampoline locality.** Modern Win11 KASLR puts non-paged pool ~27TB
+   away from win32kfull's image, far past `disp32`'s ±2GB reach, so even
+   a correctly-sized trampoline can't preserve RIP-relative semantics by
+   plain disp rewriting. The relocator first tries direct delta, then
+   falls back to **snapshot-via-data-slot**: read the 8 bytes the
+   original instruction would have referenced (safe -- we're attached
+   to a win32k-mapped process), stash them in an 8-byte slot at the
+   tail of the trampoline pool allocation, and rewrite the instruction's
+   `disp32` to point at the slot. Works for stable references (IAT
+   entries, security cookies, CFG tables) -- not for live mutable
+   kernel state.
+
+HVCI: same concern as `proc protect`. The CR0.WP toggle is rejected on
+HVCI-on machines, the CR0 path falls back to the MDL-alias write path,
+and if the EPT is also write-protecting the underlying PFN that path
+fails too. The rule is still stored on hook-install failure; the CLI's
+`win rule add` output flags `[hook-INACTIVE]` and surfaces the install
+NTSTATUS so you know which layer rejected the patch.
 
 Global behavior: `--debug` is accepted on most subcommands and prints
 intermediate IOCTL traffic; Ctrl+C cancels in-flight `DeviceIoControl`
@@ -553,7 +625,10 @@ state file across the disable / revert cycle.
 | `NTFS_FILTER_ADD / REMOVE / LIST / CLEAR` | rule-driven minifilter (FltRegisterFilter + pre-create); in-house path-aware wildcard matcher (`*` spans `\`); actions deny / notfound / readonly / log — HVCI-compatible |
 | `PROC_MONITOR_START / STOP / READ`   | real-time process create/exit stream via PsSetCreateProcessNotifyRoutineEx; in-kernel ring buffer + KEVENT, blocking IOCTL with 2s timeout for clean Ctrl+C |
 | `PROC_RULE_ADD / REMOVE / LIST / CLEAR` | image-path wildcard rules consulted from the same notify routine; `deny` sets `CreationStatus = STATUS_ACCESS_DENIED` (process create fails at the syscall), `log` audits but allows |
+| `WIN_RULE_ADD / REMOVE / LIST / CLEAR` | driver-resident window rules (title/class/pid/image patterns × close/create/destroy actions). Storage is the source of truth for both the user-mode shield DLL (close/create) and the in-kernel `NtUserDestroyWindow` hook (destroy). |
+| `HOOK_INSTALL_BY_RVA`                | install a named inline hook by `(module-basename, RVA)` -- CLI pre-resolves via DbgHelp + Microsoft symbol server and hands the driver an absolute target. Currently dispatches to the destroy-window hook installer; new HookIds extend the table in lockstep with `Public.h`. |
 | (no IOCTL, internal)                 | **undocumented NtTerminateProcess prologue hook** — patches the syscall entry to surface caller→target attribution as `TERMINATE_REQ` events in the proc-monitor ring before the kernel processes the terminate |
+| (no IOCTL, internal)                 | **NtUserDestroyWindow prologue hook** -- caller-based block-destroy enforcement; runs the session-attach + ModRM-aware LDE + data-slot RIP-rel relocator described in the `win rule` section above |
 | `SELFPROTECT_SET / STATUS`           | owner-PID gate on weaken-protection IOCTLs (force-unload, protect-unlock, selfprotect-off) |
 
 Every state-mutating IOCTL is SEH-wrapped at the dispatcher level, audited

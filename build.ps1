@@ -55,6 +55,10 @@ if ($Skip -notcontains 'cli')    {
     # Regenerate the SDK-derived status-name database (writes only if changed,
     # so this is idempotent — no rebuilds when the SDK hasn't moved).
     & (Join-Path $root 'tools\generate-status-db.ps1')
+    # Shield DLL — loaded into every GUI process by `win protect` / `win rule`
+    # via SetWindowsHookEx. Built before the CLI so it's present in OutDir
+    # alongside Winternal.exe when the install command copies binaries out.
+    Build-Project $msbuild2026 'WinternalCLI\WinternalWinShield.vcxproj' 'WinternalWinShield'
     Build-Project $msbuild2026 'WinternalCLI\WinternalCLI.vcxproj'   'WinternalCLI'
 }
 if ($Skip -notcontains 'driver') { Build-Project $msbuild2022 'Winternal\Winternal.vcxproj'        'Winternal (driver, VS2022 MSBuild)' }

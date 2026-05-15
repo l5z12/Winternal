@@ -595,6 +595,99 @@ typedef struct _WINTERNAL_PROC_PROTECT_LIST_OUT {
     WINTERNAL_PROC_PROTECT_RULE Rules[1];                       // [Count]
 } WINTERNAL_PROC_PROTECT_LIST_OUT, *PWINTERNAL_PROC_PROTECT_LIST_OUT;
 
+// ---- Window rules (driver-resident storage) ----
+//
+// Rules live in the driver so they survive CLI restarts and so the
+// shield DLL (loaded into every GUI process by `win protect`) can pull
+// from a single source of truth via IOCTL instead of from a shared
+// file-mapping owned by a transient guardian.
+//
+// Phase 1 (here): driver stores and serves rules; enforcement is still
+// the user-mode shield DLL doing subclass-drop + WH_CBT abort. Phase 2
+// (future): kernel inline hooks on NtUserDestroyWindow / NtUserCreate-
+// WindowEx for true driver-side prohibition (HVCI-fragile, so the user-
+// mode path stays as a fallback).
+#define IOCTL_WINTERNAL_WIN_RULE_ADD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_WIN_RULE_REMOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_WIN_RULE_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_WIN_RULE_CLEAR  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_WIN_RULE_MAX_RULES    64
+#define WINTERNAL_WIN_RULE_PATTERN_MAX  128
+
+// Match kinds — what gets compared against r.Pattern.
+#define WINTERNAL_WIN_KIND_TITLE_GLOB   1u
+#define WINTERNAL_WIN_KIND_CLASS_GLOB   2u
+#define WINTERNAL_WIN_KIND_PID          3u
+#define WINTERNAL_WIN_KIND_IMAGE_GLOB   4u
+
+// Action — what happens on match.
+#define WINTERNAL_WIN_ACT_BLOCK_CLOSE   0u   // subclass-drop WM_CLOSE/SC_CLOSE (shield, user-mode)
+#define WINTERNAL_WIN_ACT_BLOCK_CREATE  1u   // WH_CBT abort (shield, user-mode)
+#define WINTERNAL_WIN_ACT_BLOCK_DESTROY 2u   // NtUserDestroyWindow kernel inline hook
+                                             //   (caller-based: matches PID / IMAGE
+                                             //   of the process calling DestroyWindow).
+                                             //   HVCI-fragile -- the hook write may
+                                             //   be rejected, in which case rules
+                                             //   are stored but not enforced.
+
+// Flags reported on ADD/LIST so the CLI can tell users whether kernel-side
+// enforcement is actually engaged. Without this, an HVCI-rejected hook
+// install would look identical to a successful one from user-mode.
+#define WINTERNAL_WIN_FLAG_DESTROY_HOOK_LIVE  0x00000001u
+
+typedef struct _WINTERNAL_WIN_RULE {
+    UINT32 RuleId;                                          // 0 on ADD; assigned by driver
+    UINT32 Kind;                                            // WINTERNAL_WIN_KIND_*
+    UINT32 Action;                                          // WINTERNAL_WIN_ACT_*
+    UINT32 HitCount;                                        // populated on LIST
+    UINT32 Flags;                                           // WINTERNAL_WIN_FLAG_*
+    UINT32 LastHookError;                                   // NTSTATUS from most recent
+                                                            //   block-destroy hook-install
+                                                            //   attempt (0 = ok / N/A)
+    WCHAR  Pattern[WINTERNAL_WIN_RULE_PATTERN_MAX];         // glob or decimal PID
+} WINTERNAL_WIN_RULE, *PWINTERNAL_WIN_RULE;
+
+typedef struct _WINTERNAL_WIN_RULE_REMOVE_IN {
+    UINT32 RuleId;
+    UINT32 Reserved;
+} WINTERNAL_WIN_RULE_REMOVE_IN, *PWINTERNAL_WIN_RULE_REMOVE_IN;
+
+typedef struct _WINTERNAL_WIN_RULE_LIST_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_WIN_RULE Rules[1];                            // [Count]
+} WINTERNAL_WIN_RULE_LIST_OUT, *PWINTERNAL_WIN_RULE_LIST_OUT;
+
+// ---- HOOK_INSTALL_BY_RVA -----------------------------------------------
+//
+// CLI-driven hook install where the user-mode side has already resolved
+// the target address via DbgHelp + the matching PDB for the live build.
+// Driver maps `Module` to its loaded base, validates `Rva` against the
+// module size, and patches at base + Rva. Decoupling locate (user-mode)
+// from patch (kernel) lets us:
+//   - hit non-exported symbols (xxxDestroyWindow et al.)
+//   - stay build-agnostic without baking offsets into the .sys
+//   - keep the driver's HTTP/PDB surface area at zero
+//
+// HookId selects which detour to bind. New entries here MUST match the
+// dispatch table in Queue.c (g_HookDispatch).
+#define WINTERNAL_HOOK_ID_DESTROY_WINDOW   1u
+
+typedef struct _WINTERNAL_HOOK_RVA_REQ {
+    WCHAR  Module[64];      // file name only (e.g. "win32kfull.sys"); case-insensitive
+    UINT32 Rva;             // offset from module base where the prolog starts
+    UINT32 HookId;          // WINTERNAL_HOOK_ID_*
+} WINTERNAL_HOOK_RVA_REQ, *PWINTERNAL_HOOK_RVA_REQ;
+
+typedef struct _WINTERNAL_HOOK_RVA_RESP {
+    UINT32 Installed;       // 1 on success, 0 on failure
+    UINT32 NtStatus;        // detailed reason if Installed == 0
+    UINT64 ResolvedVa;      // base + Rva (driver-side, diagnostic)
+} WINTERNAL_HOOK_RVA_RESP, *PWINTERNAL_HOOK_RVA_RESP;
+
+#define IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8B4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 #define WINTERNAL_PROC_RULE_MAX_RULES   64
 #define WINTERNAL_PROC_RULE_PATTERN_MAX 260
 

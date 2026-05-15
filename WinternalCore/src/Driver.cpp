@@ -676,6 +676,80 @@ std::vector<DriverSession::ProcProtectRule> DriverSession::procProtectList() {
     return rules;
 }
 
+std::optional<uint32_t>
+DriverSession::winRuleAdd(WinRuleKind kind, WinRuleAction action, std::wstring_view pattern,
+                          uint32_t* outFlags, uint32_t* outLastHookError) {
+    if (pattern.empty() || pattern.size() >= WINTERNAL_WIN_RULE_PATTERN_MAX) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_WIN_RULE in{};
+    WINTERNAL_WIN_RULE out{};
+    in.Kind   = (uint32_t)kind;
+    in.Action = (uint32_t)action;
+    std::memcpy(in.Pattern, pattern.data(), pattern.size() * sizeof(wchar_t));
+    in.Pattern[pattern.size()] = 0;
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_WIN_RULE_ADD, &in, sizeof(in), &out, sizeof(out), &ret))
+        return std::nullopt;
+    if (outFlags)         *outFlags         = out.Flags;
+    if (outLastHookError) *outLastHookError = out.LastHookError;
+    return out.RuleId;
+}
+
+bool DriverSession::winRuleRemove(uint32_t ruleId) {
+    WINTERNAL_WIN_RULE_REMOVE_IN in{ ruleId, 0 };
+    return ioctl_(IOCTL_WINTERNAL_WIN_RULE_REMOVE, &in, sizeof(in), nullptr, 0, nullptr);
+}
+
+bool DriverSession::winRuleClear() {
+    return ioctl_(IOCTL_WINTERNAL_WIN_RULE_CLEAR, nullptr, 0, nullptr, 0, nullptr);
+}
+
+std::vector<DriverSession::WinRule> DriverSession::winRuleList() {
+    std::vector<WinRule> rules;
+    size_t cap = FIELD_OFFSET(WINTERNAL_WIN_RULE_LIST_OUT, Rules)
+               + (size_t)WINTERNAL_WIN_RULE_MAX_RULES * sizeof(WINTERNAL_WIN_RULE);
+    std::vector<uint8_t> buf(cap);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_WIN_RULE_LIST, nullptr, 0, buf.data(), (uint32_t)buf.size(), &ret))
+        return rules;
+    auto* lo = reinterpret_cast<PWINTERNAL_WIN_RULE_LIST_OUT>(buf.data());
+    rules.reserve(lo->Count);
+    for (uint32_t i = 0; i < lo->Count; ++i) {
+        WinRule r;
+        r.ruleId        = lo->Rules[i].RuleId;
+        r.kind          = lo->Rules[i].Kind;
+        r.action        = lo->Rules[i].Action;
+        r.hitCount      = lo->Rules[i].HitCount;
+        r.flags         = lo->Rules[i].Flags;
+        r.lastHookError = lo->Rules[i].LastHookError;
+        r.pattern       = lo->Rules[i].Pattern;
+        rules.push_back(std::move(r));
+    }
+    return rules;
+}
+
+std::optional<DriverSession::HookRvaResult>
+DriverSession::hookInstallByRva(std::wstring_view moduleBaseName, uint32_t rva, uint32_t hookId) {
+    if (moduleBaseName.empty() || moduleBaseName.size() >= 64 || rva == 0) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_HOOK_RVA_REQ  in{};
+    WINTERNAL_HOOK_RVA_RESP out{};
+    std::memcpy(in.Module, moduleBaseName.data(), moduleBaseName.size() * sizeof(wchar_t));
+    in.Module[moduleBaseName.size()] = 0;
+    in.Rva    = rva;
+    in.HookId = hookId;
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_HOOK_INSTALL_BY_RVA, &in, sizeof(in), &out, sizeof(out), &ret))
+        return std::nullopt;
+    HookRvaResult r;
+    r.installed  = (out.Installed != 0);
+    r.ntStatus   = out.NtStatus;
+    r.resolvedVa = out.ResolvedVa;
+    return r;
+}
+
 std::optional<std::vector<uint8_t>>
 DriverSession::ntfsRawRead(std::wstring_view device, uint64_t offset, uint32_t length) {
     if (length == 0 || length > WINTERNAL_NTFS_RAW_MAX) {

@@ -315,6 +315,35 @@ public:
         uint32_t flags;           // WINTERNAL_PROC_PROTECT_FLAG_HOOK_LIVE / FLAG_OB_LIVE
         std::wstring pattern;
     };
+
+    // Window rules (driver-resident; the shield DLL reads them via IOCTL).
+    enum class WinRuleKind : uint32_t {
+        TitleGlob = 1, ClassGlob = 2, Pid = 3, ImageGlob = 4
+    };
+    enum class WinRuleAction : uint32_t {
+        BlockClose = 0, BlockCreate = 1
+    };
+    struct WinRule {
+        uint32_t ruleId;
+        uint32_t kind;        // WinRuleKind
+        uint32_t action;      // WinRuleAction
+        uint32_t hitCount;
+        uint32_t flags;       // WINTERNAL_WIN_FLAG_* bits
+        uint32_t lastHookError; // NTSTATUS from last block-destroy install
+        std::wstring pattern;
+    };
+    // outFlags receives WINTERNAL_WIN_FLAG_DESTROY_HOOK_LIVE et al so the
+    // CLI can tell users whether a block-destroy rule is actually engaged.
+    // outLastHookError receives the NTSTATUS from the last hook-install
+    // attempt -- useful when the hook didn't install and you want to know
+    // why (HVCI vs LDE bug vs symbol-not-found etc.).
+    std::optional<uint32_t> winRuleAdd(WinRuleKind kind, WinRuleAction action,
+                                       std::wstring_view pattern,
+                                       uint32_t* outFlags = nullptr,
+                                       uint32_t* outLastHookError = nullptr);
+    bool                    winRuleRemove(uint32_t ruleId);
+    bool                    winRuleClear();
+    std::vector<WinRule>    winRuleList();
     // procProtectAdd returns the assigned rule ID; outFlags (if non-null)
     // receives the WINTERNAL_PROC_PROTECT_FLAG_* mask telling the caller
     // which enforcement paths are live for this rule.
@@ -323,6 +352,18 @@ public:
     bool                        procProtectRemove(uint32_t ruleId);
     bool                        procProtectClear();
     std::vector<ProcProtectRule> procProtectList();
+
+    // Install a kernel inline hook by pre-resolved RVA. Used after CLI-side
+    // PDB lookup to bypass the driver's export-only locate path -- works on
+    // non-exported symbols and across any Win11 build.
+    struct HookRvaResult {
+        bool        installed;
+        uint32_t    ntStatus;     // detailed failure reason
+        uint64_t    resolvedVa;   // base + RVA the driver computed
+    };
+    std::optional<HookRvaResult> hookInstallByRva(std::wstring_view moduleBaseName,
+                                                  uint32_t rva,
+                                                  uint32_t hookId);
 
     // Self-protection. When engaged, the driver auto-adds `ownerPid` to
     // the Ob protect list and refuses any IOCTL that would weaken
