@@ -544,6 +544,138 @@ std::vector<DriverSession::FilterRule> DriverSession::ntfsFilterList() {
     return rules;
 }
 
+bool DriverSession::procMonitorStart() {
+    return ioctl_(IOCTL_WINTERNAL_PROC_MONITOR_START, nullptr, 0, nullptr, 0, nullptr);
+}
+bool DriverSession::procMonitorStop() {
+    return ioctl_(IOCTL_WINTERNAL_PROC_MONITOR_STOP, nullptr, 0, nullptr, 0, nullptr);
+}
+std::vector<DriverSession::ProcEvent> DriverSession::procMonitorRead() {
+    std::vector<ProcEvent> out;
+    // 64 events per call is a balance between roundtrip overhead and
+    // memory for the driver's METHOD_BUFFERED copy.
+    constexpr size_t kBatch = 64;
+    size_t cap = FIELD_OFFSET(WINTERNAL_PROC_MON_OUT, Events)
+               + kBatch * sizeof(WINTERNAL_PROC_EVENT);
+    std::vector<uint8_t> buf(cap);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_PROC_MONITOR_READ, nullptr, 0,
+                buf.data(), (uint32_t)buf.size(), &ret)) return out;
+    auto* mo = reinterpret_cast<PWINTERNAL_PROC_MON_OUT>(buf.data());
+    out.reserve(mo->Count);
+    for (uint32_t i = 0; i < mo->Count; ++i) {
+        const auto& e = mo->Events[i];
+        ProcEvent r{};
+        r.timestampNs = e.TimestampNs;
+        r.eventType   = e.EventType;
+        r.pid         = e.Pid;
+        r.parentPid   = e.ParentPid;
+        r.creatingPid = e.CreatingPid;
+        r.creatingTid = e.CreatingTid;
+        r.dropped     = e.Dropped;
+        if (e.ImageLen) r.image.assign(e.Image, e.ImageLen ? e.ImageLen - 1 : 0);
+        if (e.CmdLen)   r.cmdLine.assign(e.CmdLine, e.CmdLen ? e.CmdLen - 1 : 0);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<uint32_t>
+DriverSession::procRuleAdd(std::wstring_view pattern, ProcRuleAction action, uint32_t status) {
+    if (pattern.empty() || pattern.size() >= WINTERNAL_PROC_RULE_PATTERN_MAX) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_PROC_RULE in{};
+    WINTERNAL_PROC_RULE out{};
+    in.Action = (uint32_t)action;
+    in.Status = status;
+    std::memcpy(in.Pattern, pattern.data(), pattern.size() * sizeof(wchar_t));
+    in.Pattern[pattern.size()] = 0;
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_PROC_RULE_ADD, &in, sizeof(in), &out, sizeof(out), &ret))
+        return std::nullopt;
+    return out.RuleId;
+}
+
+bool DriverSession::procRuleRemove(uint32_t ruleId) {
+    WINTERNAL_PROC_RULE_REMOVE_IN in{ ruleId, 0 };
+    return ioctl_(IOCTL_WINTERNAL_PROC_RULE_REMOVE, &in, sizeof(in), nullptr, 0, nullptr);
+}
+
+bool DriverSession::procRuleClear() {
+    return ioctl_(IOCTL_WINTERNAL_PROC_RULE_CLEAR, nullptr, 0, nullptr, 0, nullptr);
+}
+
+std::vector<DriverSession::ProcRule> DriverSession::procRuleList() {
+    std::vector<ProcRule> rules;
+    size_t cap = FIELD_OFFSET(WINTERNAL_PROC_RULE_LIST_OUT, Rules)
+               + (size_t)WINTERNAL_PROC_RULE_MAX_RULES * sizeof(WINTERNAL_PROC_RULE);
+    std::vector<uint8_t> buf(cap);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_PROC_RULE_LIST, nullptr, 0, buf.data(), (uint32_t)buf.size(), &ret))
+        return rules;
+    auto* lo = reinterpret_cast<PWINTERNAL_PROC_RULE_LIST_OUT>(buf.data());
+    rules.reserve(lo->Count);
+    for (uint32_t i = 0; i < lo->Count; ++i) {
+        ProcRule r;
+        r.ruleId     = lo->Rules[i].RuleId;
+        r.action     = lo->Rules[i].Action;
+        r.matchCount = lo->Rules[i].MatchCount;
+        r.status     = lo->Rules[i].Status;
+        r.pattern    = lo->Rules[i].Pattern;
+        rules.push_back(std::move(r));
+    }
+    return rules;
+}
+
+std::optional<uint32_t>
+DriverSession::procProtectAdd(std::wstring_view pattern, uint32_t status, uint32_t* outFlags) {
+    if (pattern.empty() || pattern.size() >= WINTERNAL_PROC_PROTECT_PATTERN_MAX) {
+        StoreError(ERROR_INVALID_PARAMETER); return std::nullopt;
+    }
+    WINTERNAL_PROC_PROTECT_RULE in{};
+    WINTERNAL_PROC_PROTECT_RULE out{};
+    in.Status = status;
+    std::memcpy(in.Pattern, pattern.data(), pattern.size() * sizeof(wchar_t));
+    in.Pattern[pattern.size()] = 0;
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_PROC_PROTECT_ADD, &in, sizeof(in), &out, sizeof(out), &ret))
+        return std::nullopt;
+    if (outFlags) *outFlags = out.Flags;
+    return out.RuleId;
+}
+
+bool DriverSession::procProtectRemove(uint32_t ruleId) {
+    WINTERNAL_PROC_PROTECT_REMOVE_IN in{ ruleId, 0 };
+    return ioctl_(IOCTL_WINTERNAL_PROC_PROTECT_REMOVE, &in, sizeof(in), nullptr, 0, nullptr);
+}
+
+bool DriverSession::procProtectClear() {
+    return ioctl_(IOCTL_WINTERNAL_PROC_PROTECT_CLEAR, nullptr, 0, nullptr, 0, nullptr);
+}
+
+std::vector<DriverSession::ProcProtectRule> DriverSession::procProtectList() {
+    std::vector<ProcProtectRule> rules;
+    size_t cap = FIELD_OFFSET(WINTERNAL_PROC_PROTECT_LIST_OUT, Rules)
+               + (size_t)WINTERNAL_PROC_PROTECT_MAX_RULES * sizeof(WINTERNAL_PROC_PROTECT_RULE);
+    std::vector<uint8_t> buf(cap);
+    uint32_t ret = 0;
+    if (!ioctl_(IOCTL_WINTERNAL_PROC_PROTECT_LIST, nullptr, 0, buf.data(), (uint32_t)buf.size(), &ret))
+        return rules;
+    auto* lo = reinterpret_cast<PWINTERNAL_PROC_PROTECT_LIST_OUT>(buf.data());
+    rules.reserve(lo->Count);
+    for (uint32_t i = 0; i < lo->Count; ++i) {
+        ProcProtectRule r;
+        r.ruleId     = lo->Rules[i].RuleId;
+        r.blockCount = lo->Rules[i].BlockCount;
+        r.status     = lo->Rules[i].Status;
+        r.flags      = lo->Rules[i].Flags;
+        r.pattern    = lo->Rules[i].Pattern;
+        rules.push_back(std::move(r));
+    }
+    return rules;
+}
+
 std::optional<std::vector<uint8_t>>
 DriverSession::ntfsRawRead(std::wstring_view device, uint64_t offset, uint32_t length) {
     if (length == 0 || length > WINTERNAL_NTFS_RAW_MAX) {

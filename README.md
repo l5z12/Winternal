@@ -471,6 +471,9 @@ state file across the disable / revert cycle.
 | `NTFS_RAW_READ`                      | ZwReadFile on a `\Device\*` from kernel mode |
 | `NTFS_VOL_DATA / USN_QUERY / USN_READ / MFT_ENUM / STREAMS` | FSCTL passthrough via `ZwFsControlFile` + `ZwQueryInformationFile` (PreviousMode=Kernel) |
 | `NTFS_FILTER_ADD / REMOVE / LIST / CLEAR` | rule-driven minifilter (FltRegisterFilter + pre-create); in-house path-aware wildcard matcher (`*` spans `\`); actions deny / notfound / readonly / log — HVCI-compatible |
+| `PROC_MONITOR_START / STOP / READ`   | real-time process create/exit stream via PsSetCreateProcessNotifyRoutineEx; in-kernel ring buffer + KEVENT, blocking IOCTL with 2s timeout for clean Ctrl+C |
+| `PROC_RULE_ADD / REMOVE / LIST / CLEAR` | image-path wildcard rules consulted from the same notify routine; `deny` sets `CreationStatus = STATUS_ACCESS_DENIED` (process create fails at the syscall), `log` audits but allows |
+| (no IOCTL, internal)                 | **undocumented NtTerminateProcess prologue hook** — patches the syscall entry to surface caller→target attribution as `TERMINATE_REQ` events in the proc-monitor ring before the kernel processes the terminate |
 | `SELFPROTECT_SET / STATUS`           | owner-PID gate on weaken-protection IOCTLs (force-unload, protect-unlock, selfprotect-off) |
 
 Every state-mutating IOCTL is SEH-wrapped at the dispatcher level, audited

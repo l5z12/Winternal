@@ -264,6 +264,66 @@ public:
     bool                    ntfsFilterClear();
     std::vector<FilterRule> ntfsFilterList();
 
+    // Real-time process monitor — driver registers PsSetCreateProcessNotifyRoutineEx
+    // and streams events through a ring buffer + blocking IOCTL.
+    struct ProcEvent {
+        uint64_t timestampNs;     // KeQuerySystemTimePrecise units (100ns)
+        uint32_t eventType;       // 0=create, 1=exit
+        uint32_t pid;
+        uint32_t parentPid;
+        uint32_t creatingPid;
+        uint32_t creatingTid;
+        uint32_t dropped;         // events lost since last read (only set on
+                                  // the first event of a chunk after a drop)
+        std::wstring image;       // full NT path
+        std::wstring cmdLine;
+    };
+    bool                    procMonitorStart();
+    bool                    procMonitorStop();
+    // Blocking read — waits up to ~2s on the kernel event; returns
+    // whatever's accumulated. Empty vector means "no events in window";
+    // call again in a loop.
+    std::vector<ProcEvent>  procMonitorRead();
+
+    // Process-create rules. Actions: 0=allow, 1=deny, 2=log. The deny
+    // path writes `status` verbatim into PS_CREATE_NOTIFY_INFO::
+    // CreationStatus — including STATUS_SUCCESS, which lets the rule
+    // "deny by lying" so callers checking the syscall return don't
+    // notice. Recommended default is STATUS_ACCESS_DENIED.
+    enum class ProcRuleAction { Allow = 0, Deny = 1, Log = 2 };
+    struct ProcRule {
+        uint32_t ruleId;
+        uint32_t action;
+        uint32_t matchCount;
+        uint32_t status;          // NTSTATUS written to CreationStatus on DENY
+        std::wstring pattern;
+    };
+    std::optional<uint32_t> procRuleAdd(std::wstring_view pattern, ProcRuleAction action,
+                                        uint32_t status);
+    bool                    procRuleRemove(uint32_t ruleId);
+    bool                    procRuleClear();
+    std::vector<ProcRule>   procRuleList();
+
+    // Process-termination protect rules. Evaluated inside the
+    // NtTerminateProcess prologue hook; a target image matching any
+    // pattern returns STATUS_ACCESS_DENIED to the terminator. Self-
+    // termination always succeeds, so the system can still exit cleanly.
+    struct ProcProtectRule {
+        uint32_t ruleId;
+        uint32_t blockCount;
+        uint32_t status;          // NTSTATUS returned from NtTerminateProcess on match
+        uint32_t flags;           // WINTERNAL_PROC_PROTECT_FLAG_HOOK_LIVE / FLAG_OB_LIVE
+        std::wstring pattern;
+    };
+    // procProtectAdd returns the assigned rule ID; outFlags (if non-null)
+    // receives the WINTERNAL_PROC_PROTECT_FLAG_* mask telling the caller
+    // which enforcement paths are live for this rule.
+    std::optional<uint32_t>     procProtectAdd(std::wstring_view pattern, uint32_t status,
+                                               uint32_t* outFlags = nullptr);
+    bool                        procProtectRemove(uint32_t ruleId);
+    bool                        procProtectClear();
+    std::vector<ProcProtectRule> procProtectList();
+
     // Self-protection. When engaged, the driver auto-adds `ownerPid` to
     // the Ob protect list and refuses any IOCTL that would weaken
     // protection (disengage, unprotect of owner, force-unload Winternal,

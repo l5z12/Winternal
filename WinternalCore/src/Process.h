@@ -43,6 +43,37 @@ bool TerminateProcessById(uint32_t pid, uint32_t exitCode = 1);
 bool SuspendProcessById(uint32_t pid);
 bool ResumeProcessById(uint32_t pid);
 
+// Aggressive termination — tries each user-mode kill technique in order
+// and returns which one succeeded (or Failed). Picks up where direct
+// TerminateProcess fails because the caller's handle was Ob-stripped of
+// PROCESS_TERMINATE, by attempting paths that need different rights:
+//
+//   Terminate       direct TerminateProcess(handle, code)
+//   HandleDupClose  Task-Manager-style: enumerate target's handles via
+//                   NtQuerySystemInformation and yank each with
+//                   DuplicateHandle(..., DUPLICATE_CLOSE_SOURCE).
+//                   Indirect kill — when the target loses its primary
+//                   token / loader / main-thread handles, it crashes.
+//                   Requires PROCESS_DUP_HANDLE on the target.
+//   ThreadTerminate enumerate target's threads, OpenThread(THREAD_TERMINATE)
+//                   each, call TerminateThread. Once every thread is
+//                   gone the process exits.
+//
+// Order is "least invasive that still kills" first. No window / WM_CLOSE
+// path here — that's user-cooperative and lives under the `close` /
+// `win` commands by design.
+enum class KillMethod : uint32_t {
+    Failed          = 0,
+    Terminate       = 1,
+    HandleDupClose  = 2,
+    ThreadTerminate = 3,
+};
+
+KillMethod TerminateProcessByIdAggressive(uint32_t pid, uint32_t exitCode = 1);
+
+// User-friendly name for logs / CLI reporting.
+const wchar_t* KillMethodName(KillMethod m);
+
 // Best-effort: fill commandLine, imagePath, user, elevated, integrity, wow64.
 void EnrichProcess(ProcessInfo& p);
 

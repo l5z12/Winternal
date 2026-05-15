@@ -123,6 +123,7 @@ typedef struct _WN_KAPC_STATE { UCHAR Opaque[64]; } WN_KAPC_STATE;
 
 NTKERNELAPI VOID NTAPI KeStackAttachProcess(_In_ PVOID Process, _Out_ PVOID ApcState);
 NTKERNELAPI VOID NTAPI KeUnstackDetachProcess(_In_ PVOID ApcState);
+NTKERNELAPI PEPROCESS NTAPI PsGetThreadProcess(_In_ PETHREAD Thread);
 
 // SID helpers — in ntifs.h, not always in ntddk.h's path.
 NTSYSAPI ULONG  NTAPI RtlLengthSid(_In_ PSID Sid);
@@ -966,19 +967,93 @@ static NTSTATUS HandleKill(PVOID InBuf, size_t InLen)
 // set/get context, set/query info, impersonation rights.
 // -----------------------------------------------------------------------------
 
+// MAXIMUM_ALLOWED (0x02000000) is the bypass killer. The kernel resolves
+// it to "everything the DACL grants" AFTER the Ob pre-op runs — if we
+// leave it set, our specific-bit strip is meaningless because the caller
+// gets PROCESS_TERMINATE back via the DACL expansion. Same with the
+// GENERIC_* bits (the kernel SHOULD map those to specific rights before
+// our callback fires, but stripping them defensively costs nothing —
+// they don't represent real rights, just request modifiers).
+#define WN_STRIP_GENERIC_BITS (MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_READ | \
+                               GENERIC_WRITE | GENERIC_EXECUTE)
+
+// Full lockdown — for explicit `protect <pid> --force`, where the user
+// has named a specific PID and accepts that VM read / query info / etc.
+// also become inaccessible. The protected PID is already running when
+// this is applied, so there's no "parent can't launch its child" path
+// to break.
 #define WN_LOCK_STRIP_PROCESS  ( \
     PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | \
     PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_DUP_HANDLE | \
     PROCESS_CREATE_PROCESS | PROCESS_SET_QUOTA | PROCESS_SET_INFORMATION | \
     PROCESS_QUERY_INFORMATION | PROCESS_SUSPEND_RESUME | \
-    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_LIMITED_INFORMATION)
+    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_LIMITED_INFORMATION | \
+    WN_STRIP_GENERIC_BITS)
 
 #define WN_LOCK_STRIP_THREAD ( \
     THREAD_TERMINATE | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | \
     THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION | \
     THREAD_SET_THREAD_TOKEN | THREAD_IMPERSONATE | \
     THREAD_DIRECT_IMPERSONATION | THREAD_QUERY_LIMITED_INFORMATION | \
-    THREAD_SET_LIMITED_INFORMATION)
+    THREAD_SET_LIMITED_INFORMATION | \
+    WN_STRIP_GENERIC_BITS)
+
+// Narrow termination-protect strip — for pattern rules. Only blocks the
+// minimum set of rights needed to terminate the target, so that adding
+// a pattern rule for a not-yet-running image doesn't also break its
+// launch. The blocked rights and what they prevent:
+//
+//   PROCESS_TERMINATE     direct NtTerminateProcess
+//   PROCESS_CREATE_THREAD CreateRemoteThread -> ExitProcess injection
+//                         (this alone is enough — writing a gadget
+//                         via PROCESS_VM_WRITE is useless without a
+//                         thread to execute it)
+//   PROCESS_DUP_HANDLE    Task Manager's fallback path: when direct
+//                         TerminateProcess returns ACCESS_DENIED, the
+//                         Win11 24H2 Taskmgr enumerates the target's
+//                         handles via NtQuerySystemInformation and
+//                         yanks each one out using
+//                           DuplicateHandle(target, h, self, &out,
+//                                           0, 0, DUPLICATE_CLOSE_SOURCE)
+//                         which requires PROCESS_DUP_HANDLE on the
+//                         TARGET. Once the target's primary token /
+//                         loader / main-thread handles are closed,
+//                         it crashes — indirect kill that never went
+//                         through NtTerminateProcess. Strip this and
+//                         that fallback dead-ends too.
+//   THREAD_TERMINATE      per-thread NtTerminateThread (several ARK
+//                         tools use this when direct termination is
+//                         refused)
+//   THREAD_SET_CONTEXT    SetThreadContext to patch RIP -> ExitProcess
+//                         (the only practical "kill via VM_WRITE" path,
+//                         and it needs SET_CONTEXT, not VM_WRITE)
+//   + sentinel bits       MAXIMUM_ALLOWED / GENERIC_* — without these
+//                         a caller can ask for "everything" and the
+//                         kernel expands the request AFTER our pre-op
+//                         runs, restoring rights we just stripped.
+//
+// Intentionally NOT stripped:
+//   PROCESS_VM_WRITE      kernel32!CreateProcessInternalW writes the env
+//                         block / RTL_USER_PROCESS_PARAMETERS / AppCompat
+//                         shim data into the new process between Nt-
+//                         CreateUserProcess and NtResumeThread. Stripping
+//                         this makes most processes (notepad included)
+//                         fail to initialize.
+//   PROCESS_VM_OPERATION  needed by parents to NtAllocateVirtualMemory
+//                         in the child during launch setup.
+//   THREAD_SUSPEND_RESUME the parent's NtResumeThread on the initial
+//                         thread requires this — without it the child
+//                         never starts.
+//   PROCESS_QUERY_*       debuggers, perfmon, Process Explorer all need
+//                         this and none of it leads to termination.
+//   PROCESS_VM_READ       symbolic debugging / inspection only.
+#define WN_TERM_PROTECT_STRIP_PROCESS  ( \
+    PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE | \
+    WN_STRIP_GENERIC_BITS)
+
+#define WN_TERM_PROTECT_STRIP_THREAD  ( \
+    THREAD_TERMINATE | THREAD_SET_CONTEXT | \
+    WN_STRIP_GENERIC_BITS)
 
 static BOOLEAN WinternalIsPidLocked(UINT32 Pid)
 {
@@ -993,6 +1068,12 @@ static BOOLEAN WinternalIsPidLocked(UINT32 Pid)
     return found;
 }
 
+// Forward — defined further down next to the proc-protect rule storage.
+static BOOLEAN WinternalProcProtectImageMatchesProcess(PEPROCESS target);
+// And the Ob registration helper, used by HandleProcProtectAdd as a
+// HVCI-safe enforcement fallback when the inline hook didn't install.
+static NTSTATUS WinternalEnsureObCallbacks(VOID);
+
 static OB_PREOP_CALLBACK_STATUS WinternalProtectPreOpProcess(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION Info)
@@ -1000,17 +1081,28 @@ static OB_PREOP_CALLBACK_STATUS WinternalProtectPreOpProcess(
     UNREFERENCED_PARAMETER(RegistrationContext);
     if (Info->KernelHandle) return OB_PREOP_SUCCESS;
 
-    UINT32 targetPid = HandleToULong(PsGetProcessId((PEPROCESS)Info->Object));
-    if (!WinternalIsPidLocked(targetPid)) return OB_PREOP_SUCCESS;
+    PEPROCESS targetProc = (PEPROCESS)Info->Object;
+    UINT32 targetPid = HandleToULong(PsGetProcessId(targetProc));
 
     // Don't strip rights from a process opening a handle to ITSELF; otherwise
     // the locked process loses access to its own threads/state.
     if ((HANDLE)(ULONG_PTR)targetPid == PsGetCurrentProcessId()) return OB_PREOP_SUCCESS;
 
+    BOOLEAN locked  = WinternalIsPidLocked(targetPid);
+    BOOLEAN matched = !locked && WinternalProcProtectImageMatchesProcess(targetProc);
+    if (!locked && !matched) return OB_PREOP_SUCCESS;
+
+    // PID-locked rules get the full strip (the caller named a specific
+    // already-running PID). Pattern-matched rules use a narrower strip
+    // that only removes kill paths, so launching a pattern-protected
+    // image still works (the parent needs THREAD_SUSPEND_RESUME on the
+    // initial thread to actually start the child).
+    ACCESS_MASK strip = locked ? WN_LOCK_STRIP_PROCESS
+                               : WN_TERM_PROTECT_STRIP_PROCESS;
     if (Info->Operation == OB_OPERATION_HANDLE_CREATE) {
-        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~WN_LOCK_STRIP_PROCESS;
+        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~strip;
     } else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~WN_LOCK_STRIP_PROCESS;
+        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~strip;
     }
     return OB_PREOP_SUCCESS;
 }
@@ -1022,15 +1114,29 @@ static OB_PREOP_CALLBACK_STATUS WinternalProtectPreOpThread(
     UNREFERENCED_PARAMETER(RegistrationContext);
     if (Info->KernelHandle) return OB_PREOP_SUCCESS;
 
-    UINT32 targetPid = HandleToULong(PsGetThreadProcessId((PETHREAD)Info->Object));
-    if (!WinternalIsPidLocked(targetPid)) return OB_PREOP_SUCCESS;
-
+    PETHREAD targetThread = (PETHREAD)Info->Object;
+    UINT32 targetPid = HandleToULong(PsGetThreadProcessId(targetThread));
     if ((HANDLE)(ULONG_PTR)targetPid == PsGetCurrentProcessId()) return OB_PREOP_SUCCESS;
 
+    BOOLEAN locked = WinternalIsPidLocked(targetPid);
+
+    // Pattern-protect also covers per-thread termination: Task Manager's
+    // End Task and many ARK-style tools call NtTerminateThread on each
+    // thread of the target after a denied NtTerminateProcess. Resolve
+    // the thread's owning process and consult the protect rules.
+    BOOLEAN matched = FALSE;
+    if (!locked) {
+        PEPROCESS owner = PsGetThreadProcess(targetThread);
+        if (owner) matched = WinternalProcProtectImageMatchesProcess(owner);
+    }
+    if (!locked && !matched) return OB_PREOP_SUCCESS;
+
+    ACCESS_MASK strip = locked ? WN_LOCK_STRIP_THREAD
+                               : WN_TERM_PROTECT_STRIP_THREAD;
     if (Info->Operation == OB_OPERATION_HANDLE_CREATE) {
-        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~WN_LOCK_STRIP_THREAD;
+        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~strip;
     } else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~WN_LOCK_STRIP_THREAD;
+        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~strip;
     }
     return OB_PREOP_SUCCESS;
 }
@@ -1560,6 +1666,1042 @@ static NTSTATUS HandleNtfsFilterClear(VOID)
     return STATUS_SUCCESS;
 }
 
+// -----------------------------------------------------------------------------
+// Real-time process monitor: PsSetCreateProcessNotifyRoutineEx + ring buffer.
+//
+// The notify routine runs in the context of the process being created/
+// destroyed at PASSIVE_LEVEL. We copy a fixed-size event record into a
+// SPSC-style ring under a spinlock and signal a KEVENT. The IOCTL READ
+// handler blocks on that event with a 2-second timeout (so CLI Ctrl+C
+// can stop the loop), drains as many events as fit in the user's
+// buffer, and returns. The ring is overwrite-on-overflow — events are
+// never queued in pageable memory or paged out, and a slow consumer
+// just sees stale ranges (the `Dropped` field tells them how many).
+// -----------------------------------------------------------------------------
+
+static WINTERNAL_PROC_EVENT g_ProcRing[WINTERNAL_PROC_RING_SIZE];
+static volatile LONG  g_ProcRingHead    = 0;   // index where the next event goes
+static volatile LONG  g_ProcRingCount   = 0;   // # of unread events
+static volatile ULONG g_ProcDroppedSinceRead = 0;
+static volatile LONG  g_ProcMonActive   = 0;   // controls whether events go to ring
+static volatile LONG  g_ProcNotifyReg   = 0;   // is PsSet*NotifyRoutineEx installed?
+static KEVENT         g_ProcMonEvent;
+static BOOLEAN        g_ProcMonEventInit = FALSE;
+static KSPIN_LOCK     g_ProcMonLock;
+static BOOLEAN        g_ProcMonLockInit  = FALSE;
+
+// PID → image cache. Populated by the create branch of the notify
+// callback; the exit branch reads it (SeLocateProcessImageName at exit
+// time is unreliable because the image section is partway torn down).
+// Direct-mapped by `(pid >> 2) % BUCKETS` — Windows PIDs are multiples
+// of 4 so this distributes well. Collisions overwrite, which is fine:
+// the previous PID's image is just unavailable on its exit. 1024 slots
+// covers ~typical concurrent-process counts with negligible miss rate.
+#define WN_PROC_CACHE_BUCKETS 1024u
+typedef struct _WN_PROC_CACHE_ENTRY {
+    UINT32 Pid;
+    USHORT ImageLen;                              // wchars incl. NUL
+    WCHAR  Image[WINTERNAL_PROC_IMAGE_MAX];
+} WN_PROC_CACHE_ENTRY;
+static WN_PROC_CACHE_ENTRY g_ProcCache[WN_PROC_CACHE_BUCKETS];
+static KSPIN_LOCK g_ProcCacheSpin;
+static BOOLEAN    g_ProcCacheSpinInit = FALSE;
+
+static VOID WinternalProcCacheSet(UINT32 pid, const WCHAR* image, USHORT imageLen)
+{
+    if (!g_ProcCacheSpinInit) return;
+    ULONG slot = (pid >> 2) % WN_PROC_CACHE_BUCKETS;
+    USHORT n = imageLen >= WINTERNAL_PROC_IMAGE_MAX ? WINTERNAL_PROC_IMAGE_MAX - 1 : imageLen;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcCacheSpin, &irql);
+    g_ProcCache[slot].Pid = pid;
+    if (image && n > 0) RtlCopyMemory(g_ProcCache[slot].Image, image, n * sizeof(WCHAR));
+    g_ProcCache[slot].Image[n] = 0;
+    g_ProcCache[slot].ImageLen = (USHORT)(n + (n ? 1 : 0));
+    KeReleaseSpinLock(&g_ProcCacheSpin, irql);
+}
+
+static BOOLEAN WinternalProcCacheGet(UINT32 pid, WCHAR* out, USHORT outCap, UINT32* outLen)
+{
+    if (!g_ProcCacheSpinInit) return FALSE;
+    ULONG slot = (pid >> 2) % WN_PROC_CACHE_BUCKETS;
+    BOOLEAN found = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcCacheSpin, &irql);
+    if (g_ProcCache[slot].Pid == pid && g_ProcCache[slot].ImageLen > 0) {
+        USHORT n = g_ProcCache[slot].ImageLen;
+        if (n > outCap) n = outCap;
+        RtlCopyMemory(out, g_ProcCache[slot].Image, n * sizeof(WCHAR));
+        *outLen = n;
+        found = TRUE;
+    }
+    KeReleaseSpinLock(&g_ProcCacheSpin, irql);
+    return found;
+}
+
+static VOID WinternalProcCacheEvict(UINT32 pid)
+{
+    if (!g_ProcCacheSpinInit) return;
+    ULONG slot = (pid >> 2) % WN_PROC_CACHE_BUCKETS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcCacheSpin, &irql);
+    if (g_ProcCache[slot].Pid == pid) {
+        g_ProcCache[slot].Pid      = 0;
+        g_ProcCache[slot].ImageLen = 0;
+    }
+    KeReleaseSpinLock(&g_ProcCacheSpin, irql);
+}
+
+// Process-create block rules. Independent of g_ProcMonActive — rules can
+// be in effect while the monitor is off (and vice versa). Both run from
+// the same WinternalProcNotify callback.
+typedef struct _WN_PROC_RULE_LIVE {
+    UINT32 RuleId;
+    UINT32 Action;
+    UINT32 MatchCount;
+    NTSTATUS Status;                            // override for DENY (0 = use default)
+    WCHAR  Pattern[WINTERNAL_PROC_RULE_PATTERN_MAX];
+    USHORT PatternLen;                          // wchars excluding NUL
+} WN_PROC_RULE_LIVE;
+
+static WN_PROC_RULE_LIVE g_ProcRules[WINTERNAL_PROC_RULE_MAX_RULES];
+static ULONG      g_ProcRuleCount   = 0;
+static UINT32     g_ProcRuleNextId  = 1;
+static KSPIN_LOCK g_ProcRuleSpin;
+static BOOLEAN    g_ProcRuleSpinInit = FALSE;
+
+// Evaluate proc rules against an image path. Returns the matching
+// action (WINTERNAL_PROC_ACT_*) and writes the rule ID + DENY status
+// override (zero when unset). (UINT32)-1 action = no match.
+// Spinlock-protected; cheap when list is empty.
+static UINT32 WinternalProcRuleEvaluate(PCUNICODE_STRING image, UINT32* outRuleId, NTSTATUS* outStatus)
+{
+    *outRuleId = 0;
+    *outStatus = 0;
+    if (!g_ProcRuleSpinInit || g_ProcRuleCount == 0 || !image || !image->Buffer)
+        return (UINT32)-1;
+
+    UINT32 action = (UINT32)-1;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+    for (ULONG i = 0; i < g_ProcRuleCount; ++i) {
+        if (WinternalMatchWildcard(g_ProcRules[i].Pattern, g_ProcRules[i].PatternLen,
+                                   image->Buffer, image->Length / sizeof(WCHAR))) {
+            g_ProcRules[i].MatchCount++;
+            action     = g_ProcRules[i].Action;
+            *outRuleId = g_ProcRules[i].RuleId;
+            *outStatus = g_ProcRules[i].Status;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    return action;
+}
+
+// Forward — actual definition lives next to the NtTerminateProcess hook
+// install/uninstall block further down. The protect-add handler refuses
+// adds when the hook isn't live, so the flag has to be readable here.
+static BOOLEAN g_NtTermHookInstalled;
+
+// PsGetProcessSectionBaseAddress is exported from ntoskrnl but doesn't
+// appear in any wdk.h. Declared locally; resolves to the EXE image base
+// of the new process, where its PE header lives.
+NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(_In_ PEPROCESS Process);
+
+// ZwProtectVirtualMemory is Nt-class but exported from ntoskrnl via the
+// Zw alias; lets us flip user-mode page protection from kernel context.
+NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
+    _In_ HANDLE ProcessHandle,
+    _Inout_ PVOID* BaseAddress,
+    _Inout_ PSIZE_T NumberOfBytesToProtect,
+    _In_ ULONG NewAccessProtection,
+    _Out_ PULONG OldAccessProtection);
+
+#ifndef PAGE_EXECUTE_READWRITE
+#define PAGE_EXECUTE_READWRITE 0x40
+#endif
+
+// Phase-2 MITM: patch the new process's entry point with a 2-byte
+// infinite-loop shim (EB FE = JMP $-2) BEFORE the initial thread starts.
+// Even if the termination flag set immediately after this somehow lets
+// the thread reach user mode, the only user code it can run is our spin
+// — never any instruction of the original (malicious) image. The
+// kernel's APC delivery on the next quantum tears the thread down.
+//
+// Why patch the entry point instead of substituting a stub process:
+// the new EPROCESS already has the image mapped, handles allocated,
+// and the syscall-return path will hand the caller valid hProcess/
+// hThread. Spawning a separate stub and rewiring handles would require
+// modifying handle-table entries in the caller's process — far more
+// fragile across Windows versions. Patching is a one-page write.
+//
+// Failure modes (all safe-fail to "still terminated, just no shim"):
+//   - PE header malformed (paranoid check)
+//   - Entry-point page not mapped yet (rare at this stage; image is
+//     mapped before the create-notify fires)
+//   - ZwProtectVirtualMemory rejects (HVCI on user pages doesn't, but
+//     guard pages or section flags could). Caller still sees a dead
+//     process via ZwTerminateProcess from the surrounding context.
+static NTSTATUS WinternalInstallEntryStub(PEPROCESS Process)
+{
+    if (!Process) return STATUS_INVALID_PARAMETER;
+    PVOID imageBase = PsGetProcessSectionBaseAddress(Process);
+    if (!imageBase) return STATUS_NOT_FOUND;
+
+    WN_KAPC_STATE apc;
+    KeStackAttachProcess(Process, &apc);
+
+    NTSTATUS finalStatus = STATUS_UNSUCCESSFUL;
+    __try {
+        PIMAGE_DOS_HEADER dh = (PIMAGE_DOS_HEADER)imageBase;
+        if (dh->e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUCHAR)imageBase + dh->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) __leave;
+        ULONG epRva = nt->OptionalHeader.AddressOfEntryPoint;
+        if (epRva == 0) __leave;     // DLL or odd binary, skip
+        PVOID ep = (PUCHAR)imageBase + epRva;
+
+        PVOID  addr     = ep;
+        SIZE_T sz       = 2;
+        ULONG  oldProt  = 0;
+        // Flip to RWX while attached. NtCurrentProcess() == -1 acts on
+        // the process we're stack-attached to.
+        NTSTATUS p = ZwProtectVirtualMemory((HANDLE)(LONG_PTR)-1, &addr, &sz,
+                                            PAGE_EXECUTE_READWRITE, &oldProt);
+        if (!NT_SUCCESS(p)) __leave;
+
+        ((PUCHAR)ep)[0] = 0xEB;     // JMP rel8
+        ((PUCHAR)ep)[1] = 0xFE;     // -2 -> spins on itself
+        // No need to flush the icache: this process's threads haven't
+        // run yet, so no stale fetch of the original bytes can exist.
+
+        addr = ep; sz = 2;
+        (void)ZwProtectVirtualMemory((HANDLE)(LONG_PTR)-1, &addr, &sz, oldProt, &oldProt);
+        finalStatus = STATUS_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        finalStatus = (NTSTATUS)GetExceptionCode();
+    }
+
+    KeUnstackDetachProcess(&apc);
+    return finalStatus;
+}
+
+// Process-termination protect rules. Independent of proc-create rules:
+// these veto NtTerminateProcess based on the TARGET image, not the
+// creator. Evaluated inside WinternalNtTerminateProcess_Detour. A
+// process is always allowed to terminate itself (ProcessHandle == self),
+// otherwise the system livelocks on normal exit paths.
+typedef struct _WN_PROC_PROTECT_LIVE {
+    UINT32 RuleId;
+    UINT32 BlockCount;
+    NTSTATUS Status;                            // returned to terminator on match
+    WCHAR  Pattern[WINTERNAL_PROC_PROTECT_PATTERN_MAX];
+    USHORT PatternLen;                          // wchars excluding NUL
+} WN_PROC_PROTECT_LIVE;
+
+static WN_PROC_PROTECT_LIVE g_ProcProtect[WINTERNAL_PROC_PROTECT_MAX_RULES];
+static ULONG      g_ProcProtectCount   = 0;
+static UINT32     g_ProcProtectNextId  = 1;
+static KSPIN_LOCK g_ProcProtectSpin;
+static BOOLEAN    g_ProcProtectSpinInit = FALSE;
+
+// HVCI-safe enforcement path: invoked from the Ob handle-create pre-op
+// when the NtTerminateProcess inline hook couldn't be installed (CR0.WP
+// rejected). Looks up the target's image and tests it against the same
+// rule list as the syscall hook. The pre-op then strips PROCESS_TERMINATE
+// so OpenProcess(PROCESS_TERMINATE) returns a handle without that bit,
+// and NtTerminateProcess fails naturally with STATUS_ACCESS_DENIED. We
+// can't return a custom NTSTATUS through this path — Ob callbacks only
+// strip rights, they don't synthesize return values — so the per-rule
+// Status override only takes effect when the inline hook is also live.
+//
+// Image-lookup chain mirrors the EXIT path: PID cache (fast and reliable
+// for processes Winternal saw being created), then SeLocateProcessImageName
+// (allocates), then PsGetProcessImageFileName (short 15-char name, no
+// allocation — last-resort match against e.g. `notepad.exe`).
+static BOOLEAN WinternalProcProtectImageMatchesProcess(PEPROCESS target)
+{
+    if (!g_ProcProtectSpinInit || g_ProcProtectCount == 0 || !target) return FALSE;
+
+    UINT32 pid = HandleToULong(PsGetProcessId(target));
+    WCHAR  cacheBuf[WINTERNAL_PROC_IMAGE_MAX];
+    UINT32 cacheLen = 0;
+
+    PCWSTR  imgPtr = NULL;
+    USHORT  imgLen = 0;
+    BOOLEAN viaSeLocate = FALSE;
+    PUNICODE_STRING seImg = NULL;
+    WCHAR   shortBuf[64];
+
+    if (WinternalProcCacheGet(pid, cacheBuf, WINTERNAL_PROC_IMAGE_MAX, &cacheLen) &&
+        cacheLen > 1) {
+        imgPtr = cacheBuf;
+        imgLen = (USHORT)(cacheLen - 1);    // cache stores n+1, drop NUL
+    } else if (NT_SUCCESS(SeLocateProcessImageName(target, &seImg)) && seImg && seImg->Buffer) {
+        imgPtr = seImg->Buffer;
+        imgLen = (USHORT)(seImg->Length / sizeof(WCHAR));
+        viaSeLocate = TRUE;
+    } else {
+        UCHAR* sn = PsGetProcessImageFileName(target);
+        if (sn) {
+            USHORT n = 0;
+            while (n < 15 && sn[n]) { shortBuf[n] = (WCHAR)sn[n]; ++n; }
+            if (n == 0) return FALSE;
+            shortBuf[n] = 0;
+            imgPtr = shortBuf;
+            imgLen = n;
+        } else {
+            return FALSE;
+        }
+    }
+
+    BOOLEAN hit = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    for (ULONG i = 0; i < g_ProcProtectCount; ++i) {
+        if (WinternalMatchWildcard(g_ProcProtect[i].Pattern, g_ProcProtect[i].PatternLen,
+                                   imgPtr, imgLen)) {
+            g_ProcProtect[i].BlockCount++;
+            hit = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+
+    if (viaSeLocate && seImg) ExFreePool(seImg);
+    return hit;
+}
+
+// Evaluate protect rules against a cached image path. Returns the rule
+// ID that matched (0 = no match) and writes the per-rule Status the
+// caller should return verbatim. Bumps BlockCount so `proc protect list`
+// shows enforcement counts.
+static UINT32 WinternalProcProtectEvaluate(PCWSTR image, USHORT imageLen, NTSTATUS* outStatus)
+{
+    *outStatus = STATUS_ACCESS_DENIED;
+    if (!g_ProcProtectSpinInit || g_ProcProtectCount == 0 || !image || imageLen == 0)
+        return 0;
+
+    UINT32 hit = 0;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    for (ULONG i = 0; i < g_ProcProtectCount; ++i) {
+        if (WinternalMatchWildcard(g_ProcProtect[i].Pattern, g_ProcProtect[i].PatternLen,
+                                   image, imageLen)) {
+            g_ProcProtect[i].BlockCount++;
+            hit = g_ProcProtect[i].RuleId;
+            *outStatus = g_ProcProtect[i].Status;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+    return hit;
+}
+
+static VOID WinternalProcNotify(
+    _Inout_ PEPROCESS Process,
+    _In_    HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    UNREFERENCED_PARAMETER(Process);
+
+    // Build the event record up front; we'll either ring-buffer it
+    // (monitor active) or only audit it (rules-only), and the rule
+    // evaluation needs the image path either way.
+    WINTERNAL_PROC_EVENT ev = {0};
+    LARGE_INTEGER ts;
+    KeQuerySystemTimePrecise(&ts);
+    ev.TimestampNs = (UINT64)ts.QuadPart;
+    ev.Pid         = (UINT32)(ULONG_PTR)ProcessId;
+
+    UINT32   ruleAction = (UINT32)-1;
+    UINT32   ruleId     = 0;
+    NTSTATUS ruleStatus = 0;
+
+    if (CreateInfo) {
+        ev.EventType = WINTERNAL_PROC_EV_CREATE;
+        ev.ParentPid  = (UINT32)(ULONG_PTR)CreateInfo->ParentProcessId;
+        ev.CreatingPid = (UINT32)(ULONG_PTR)CreateInfo->CreatingThreadId.UniqueProcess;
+        ev.CreatingTid = (UINT32)(ULONG_PTR)CreateInfo->CreatingThreadId.UniqueThread;
+        if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer) {
+            USHORT n = CreateInfo->ImageFileName->Length / sizeof(WCHAR);
+            if (n >= WINTERNAL_PROC_IMAGE_MAX) n = WINTERNAL_PROC_IMAGE_MAX - 1;
+            RtlCopyMemory(ev.Image, CreateInfo->ImageFileName->Buffer, n * sizeof(WCHAR));
+            ev.Image[n] = 0;
+            ev.ImageLen = n + 1;
+        }
+        if (CreateInfo->CommandLine && CreateInfo->CommandLine->Buffer) {
+            USHORT n = CreateInfo->CommandLine->Length / sizeof(WCHAR);
+            if (n >= WINTERNAL_PROC_CMD_MAX) n = WINTERNAL_PROC_CMD_MAX - 1;
+            RtlCopyMemory(ev.CmdLine, CreateInfo->CommandLine->Buffer, n * sizeof(WCHAR));
+            ev.CmdLine[n] = 0;
+            ev.CmdLen = n + 1;
+        }
+
+        // Cache the image for the EXIT branch — SeLocateProcessImageName
+        // doesn't always work once the process is exiting. Use ImageLen
+        // (excl. NUL) so the cache stores trimmed-correct strings.
+        if (ev.ImageLen > 0) {
+            WinternalProcCacheSet(ev.Pid, ev.Image, (USHORT)(ev.ImageLen - 1));
+        }
+
+        // Rule evaluation on creates. We can't evaluate on exit (no image).
+        ruleAction = WinternalProcRuleEvaluate(CreateInfo->ImageFileName, &ruleId, &ruleStatus);
+        if (ruleAction == WINTERNAL_PROC_ACT_DENY) {
+            NTSTATUS denyStatus = (NTSTATUS)ruleStatus;
+            if (NT_SUCCESS(denyStatus)) {
+                // GHOST-DENY (MITM for fool-the-caller cases): the rule
+                // wants the caller to see SUCCESS but the process must
+                // not actually run. CreationStatus is the documented
+                // veto signal — leaving it at SUCCESS lets the kernel
+                // proceed with the create as if nothing happened. We
+                // *also* terminate the new process from inside this
+                // notify callback. Because PspUserThreadStartup checks
+                // PEPROCESS termination state before transitioning to
+                // ring 3, the initial thread is created but never
+                // executes a single user-mode instruction. Caller sees:
+                //   CreateProcess() -> TRUE, valid hProcess + hThread
+                //   WaitForSingleObject(hProcess) -> immediate WAIT_OBJECT_0
+                //   GetExitCodeProcess(hProcess) -> denyStatus (the value
+                //                                   the rule was configured
+                //                                   with — including 0 to
+                //                                   look like a clean exit)
+                // Belt-and-suspenders: even if the kernel state check
+                // somehow lets the initial thread escape into ring 3,
+                // we ALSO patch the would-be entry point with a tiny
+                // ring-3 shim that spins forever. Combined with the
+                // termination flag set just below, the thread can do
+                // at most "JMP $-2" before its kernel-asynchronous
+                // termination APC fires — no malware code runs.
+                (void)WinternalInstallEntryStub(Process);
+                HANDLE phandle = NULL;
+                NTSTATUS oh = ObOpenObjectByPointer(Process, OBJ_KERNEL_HANDLE,
+                                                    NULL, PROCESS_TERMINATE,
+                                                    *PsProcessType, KernelMode,
+                                                    &phandle);
+                if (NT_SUCCESS(oh) && phandle) {
+                    ZwTerminateProcess(phandle, denyStatus);
+                    ZwClose(phandle);
+                }
+                // CreationStatus left at SUCCESS — kernel proceeds.
+            } else {
+                // Hard deny: status is both the veto signal and the syscall
+                // return value. Caller sees this NTSTATUS from CreateProcess.
+                CreateInfo->CreationStatus = denyStatus;
+            }
+            AuditAppend(IOCTL_WINTERNAL_PROC_RULE_ADD,
+                        (UINT64)(ULONG_PTR)CreateInfo->ImageFileName->Buffer,
+                        ruleId, denyStatus);
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] proc rule %u DENIED %wZ (%s)\n",
+                       ruleId, CreateInfo->ImageFileName,
+                       NT_SUCCESS(denyStatus) ? "ghost" : "hard");
+        } else if (ruleAction == WINTERNAL_PROC_ACT_LOG) {
+            AuditAppend(IOCTL_WINTERNAL_PROC_RULE_ADD,
+                        (UINT64)(ULONG_PTR)CreateInfo->ImageFileName->Buffer,
+                        ruleId, STATUS_SUCCESS);
+        }
+    } else {
+        ev.EventType = WINTERNAL_PROC_EV_EXIT;
+        // 1. Cache lookup (the create branch stored the full NT path).
+        // 2. SeLocateProcessImageName (works while the process is still
+        //    technically alive; flaky once it's deep into teardown).
+        // 3. PsGetProcessImageFileName — 15-char short name from EPROCESS,
+        //    always available, last-resort.
+        UINT32 cachedLen = 0;
+        if (WinternalProcCacheGet(ev.Pid, ev.Image, WINTERNAL_PROC_IMAGE_MAX, &cachedLen)) {
+            ev.ImageLen = cachedLen;
+        } else {
+            PUNICODE_STRING img = NULL;
+            if (NT_SUCCESS(SeLocateProcessImageName(Process, &img)) && img && img->Buffer) {
+                USHORT n = img->Length / sizeof(WCHAR);
+                if (n >= WINTERNAL_PROC_IMAGE_MAX) n = WINTERNAL_PROC_IMAGE_MAX - 1;
+                RtlCopyMemory(ev.Image, img->Buffer, n * sizeof(WCHAR));
+                ev.Image[n] = 0;
+                ev.ImageLen = n + 1;
+                ExFreePool(img);
+            } else {
+                UCHAR* sn = PsGetProcessImageFileName(Process);
+                if (sn) {
+                    USHORT i = 0;
+                    while (i < 15 && sn[i]) { ev.Image[i] = (WCHAR)sn[i]; ++i; }
+                    ev.Image[i] = 0;
+                    ev.ImageLen = i ? (UINT32)(i + 1) : 0;
+                }
+            }
+        }
+        // Free the cache slot — this process is gone.
+        WinternalProcCacheEvict(ev.Pid);
+    }
+
+    // Always feed events into the ring when monitor is active OR a rule
+    // fired (so the user can `proc monitor` and see denials).
+    if (!g_ProcMonActive && ruleAction == (UINT32)-1) return;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcMonLock, &irql);
+    if (g_ProcRingCount >= (LONG)WINTERNAL_PROC_RING_SIZE) {
+        InterlockedIncrement((LONG*)&g_ProcDroppedSinceRead);
+    } else {
+        g_ProcRingCount++;
+    }
+    LONG slot = g_ProcRingHead;
+    g_ProcRingHead = (g_ProcRingHead + 1) % WINTERNAL_PROC_RING_SIZE;
+    g_ProcRing[slot] = ev;
+    KeReleaseSpinLock(&g_ProcMonLock, irql);
+
+    KeSetEvent(&g_ProcMonEvent, IO_NO_INCREMENT, FALSE);
+}
+
+// Initialize globals + register the kernel-side notify routine. Called
+// once from DriverEntry. Decoupling registration from monitor start/stop
+// lets process-create rules work even when no CLI is "subscribed".
+// Forward decls for the undocumented NtTerminateProcess hook (defined
+// further down, after the proc-monitor globals it relies on).
+static NTSTATUS WinternalInstallNtTermHook(VOID);
+static VOID     WinternalUninstallNtTermHook(VOID);
+
+NTSTATUS WinternalProcMonitorInit(VOID)
+{
+    if (!g_ProcMonEventInit) {
+        KeInitializeEvent(&g_ProcMonEvent, NotificationEvent, FALSE);
+        g_ProcMonEventInit = TRUE;
+    }
+    if (!g_ProcMonLockInit) {
+        KeInitializeSpinLock(&g_ProcMonLock);
+        g_ProcMonLockInit = TRUE;
+    }
+    if (!g_ProcRuleSpinInit) {
+        KeInitializeSpinLock(&g_ProcRuleSpin);
+        g_ProcRuleSpinInit = TRUE;
+    }
+    if (!g_ProcProtectSpinInit) {
+        KeInitializeSpinLock(&g_ProcProtectSpin);
+        g_ProcProtectSpinInit = TRUE;
+    }
+    if (!g_ProcCacheSpinInit) {
+        KeInitializeSpinLock(&g_ProcCacheSpin);
+        RtlZeroMemory(g_ProcCache, sizeof(g_ProcCache));
+        g_ProcCacheSpinInit = TRUE;
+    }
+    if (InterlockedCompareExchange(&g_ProcNotifyReg, 1, 0) != 0)
+        return STATUS_SUCCESS;     // idempotent
+
+    NTSTATUS s = PsSetCreateProcessNotifyRoutineEx(WinternalProcNotify, FALSE);
+    if (!NT_SUCCESS(s)) {
+        InterlockedExchange(&g_ProcNotifyReg, 0);
+        return s;
+    }
+    // Best-effort: install the undocumented NtTerminateProcess prologue
+    // hook for caller attribution on termination requests. HVCI may
+    // reject the kernel-code write — we log and continue (the create+
+    // exit notify path still gives partial visibility).
+    NTSTATUS hookStatus;
+    __try {
+        hookStatus = WinternalInstallNtTermHook();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hookStatus = (NTSTATUS)GetExceptionCode();
+    }
+    if (!NT_SUCCESS(hookStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[winternal] NtTerminateProcess hook install -> 0x%08X "
+                   "(no TERMINATE_REQ attribution available)\n", hookStatus);
+    }
+    return STATUS_SUCCESS;
+}
+
+// `proc monitor start` / `stop` now just toggles whether events flow
+// into the ring. The notify routine itself stays registered for the
+// driver's lifetime so rule-based denies don't depend on any user-mode
+// process being subscribed.
+static NTSTATUS HandleProcMonitorStart(VOID)
+{
+    InterlockedExchange(&g_ProcMonActive, 1);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcMonitorStop(VOID)
+{
+    InterlockedExchange(&g_ProcMonActive, 0);
+    if (g_ProcMonEventInit) KeSetEvent(&g_ProcMonEvent, IO_NO_INCREMENT, FALSE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcMonitorRead(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_PROC_MON_OUT, Events);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    if (!g_ProcMonActive) return STATUS_DEVICE_NOT_READY;
+
+    ULONG maxEvents = (ULONG)((OutLen - header) / sizeof(WINTERNAL_PROC_EVENT));
+    PWINTERNAL_PROC_MON_OUT out = (PWINTERNAL_PROC_MON_OUT)OutBuf;
+
+    // Wait up to 2 seconds for new data. Short enough that CLI Ctrl+C
+    // unblocks the loop within a sensible time without busy-polling.
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -10LL * 1000 * 1000 * 2;  // 2 s
+    KeWaitForSingleObject(&g_ProcMonEvent, Executive, KernelMode, FALSE, &timeout);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcMonLock, &irql);
+    ULONG available = (ULONG)g_ProcRingCount;
+    if (available > maxEvents) available = maxEvents;
+    LONG tail = (g_ProcRingHead - g_ProcRingCount + WINTERNAL_PROC_RING_SIZE) %
+                 WINTERNAL_PROC_RING_SIZE;
+    for (ULONG i = 0; i < available; ++i) {
+        out->Events[i] = g_ProcRing[(tail + i) % WINTERNAL_PROC_RING_SIZE];
+    }
+    g_ProcRingCount -= (LONG)available;
+    // Attach the dropped counter to the first event we hand back so the
+    // consumer can see the loss. Reset the counter after.
+    if (available > 0 && g_ProcDroppedSinceRead) {
+        out->Events[0].Dropped = g_ProcDroppedSinceRead;
+        g_ProcDroppedSinceRead = 0;
+    }
+    if (g_ProcRingCount == 0) KeClearEvent(&g_ProcMonEvent);
+    KeReleaseSpinLock(&g_ProcMonLock, irql);
+
+    out->Count    = available;
+    out->Reserved = 0;
+    *Written = header + (size_t)available * sizeof(WINTERNAL_PROC_EVENT);
+    return STATUS_SUCCESS;
+}
+
+// ---- proc rule add/remove/list/clear ----
+static NTSTATUS HandleProcRuleAdd(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_PROC_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_PROC_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_RULE in = (PWINTERNAL_PROC_RULE)InBuf;
+
+    USHORT plen = 0;
+    while (plen < WINTERNAL_PROC_RULE_PATTERN_MAX && in->Pattern[plen]) ++plen;
+    if (plen == 0 || plen >= WINTERNAL_PROC_RULE_PATTERN_MAX) return STATUS_INVALID_PARAMETER;
+    if (in->Action > WINTERNAL_PROC_ACT_LOG) return STATUS_INVALID_PARAMETER;
+    if (!g_ProcNotifyReg) return STATUS_DEVICE_NOT_READY;  // not registered yet
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+    if (g_ProcRuleCount >= WINTERNAL_PROC_RULE_MAX_RULES) {
+        KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    WN_PROC_RULE_LIVE* r = &g_ProcRules[g_ProcRuleCount];
+    r->RuleId     = g_ProcRuleNextId++;
+    r->Action     = in->Action;
+    r->MatchCount = 0;
+    r->Status     = (NTSTATUS)in->Status;
+    RtlCopyMemory(r->Pattern, in->Pattern, plen * sizeof(WCHAR));
+    r->Pattern[plen] = 0;
+    r->PatternLen = plen;
+    UINT32 assignedId = r->RuleId;
+    ++g_ProcRuleCount;
+    KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+
+    PWINTERNAL_PROC_RULE out = (PWINTERNAL_PROC_RULE)OutBuf;
+    RtlCopyMemory(out, in, sizeof(*out));
+    out->RuleId = assignedId;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcRuleRemove(PVOID InBuf, size_t InLen)
+{
+    if (InLen < sizeof(WINTERNAL_PROC_RULE_REMOVE_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_RULE_REMOVE_IN in = (PWINTERNAL_PROC_RULE_REMOVE_IN)InBuf;
+    if (!g_ProcRuleSpinInit) return STATUS_NOT_FOUND;
+
+    KIRQL irql;
+    BOOLEAN removed = FALSE;
+    KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+    for (ULONG i = 0; i < g_ProcRuleCount; ++i) {
+        if (g_ProcRules[i].RuleId == in->RuleId) {
+            for (ULONG j = i; j + 1 < g_ProcRuleCount; ++j) g_ProcRules[j] = g_ProcRules[j + 1];
+            --g_ProcRuleCount;
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    return removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static NTSTATUS HandleProcRuleList(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_PROC_RULE_LIST_OUT, Rules);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_RULE_LIST_OUT out = (PWINTERNAL_PROC_RULE_LIST_OUT)OutBuf;
+    ULONG maxRules = (ULONG)((OutLen - header) / sizeof(WINTERNAL_PROC_RULE));
+
+    if (!g_ProcRuleSpinInit) {
+        out->Count = 0; out->Reserved = 0;
+        *Written = header;
+        return STATUS_SUCCESS;
+    }
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+    ULONG toReturn = g_ProcRuleCount < maxRules ? g_ProcRuleCount : maxRules;
+    for (ULONG i = 0; i < toReturn; ++i) {
+        out->Rules[i].RuleId     = g_ProcRules[i].RuleId;
+        out->Rules[i].Action     = g_ProcRules[i].Action;
+        out->Rules[i].MatchCount = g_ProcRules[i].MatchCount;
+        out->Rules[i].Status     = (UINT32)g_ProcRules[i].Status;
+        RtlCopyMemory(out->Rules[i].Pattern, g_ProcRules[i].Pattern,
+                      (g_ProcRules[i].PatternLen + 1) * sizeof(WCHAR));
+    }
+    out->Count = toReturn;
+    out->Reserved = 0;
+    KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+
+    *Written = header + toReturn * sizeof(WINTERNAL_PROC_RULE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcRuleClear(VOID)
+{
+    if (!g_ProcRuleSpinInit) return STATUS_SUCCESS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+    RtlZeroMemory(g_ProcRules, sizeof(g_ProcRules));
+    g_ProcRuleCount  = 0;
+    g_ProcRuleNextId = 1;
+    KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    return STATUS_SUCCESS;
+}
+
+// ---- proc protect add/remove/list/clear ----
+//
+// The protect list is meaningful only while the NtTerminateProcess hook
+// is installed (the detour is what consults it). If hook install failed
+// at DriverEntry (HVCI rejecting the CR0 write), adds return
+// STATUS_DEVICE_NOT_READY so callers don't silently believe they're
+// protected when nothing is enforcing it.
+static NTSTATUS HandleProcProtectAdd(PVOID InBuf, size_t InLen, PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    if (InLen  < sizeof(WINTERNAL_PROC_PROTECT_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    if (OutLen < sizeof(WINTERNAL_PROC_PROTECT_RULE)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_PROTECT_RULE in = (PWINTERNAL_PROC_PROTECT_RULE)InBuf;
+
+    USHORT plen = 0;
+    while (plen < WINTERNAL_PROC_PROTECT_PATTERN_MAX && in->Pattern[plen]) ++plen;
+    if (plen == 0 || plen >= WINTERNAL_PROC_PROTECT_PATTERN_MAX) return STATUS_INVALID_PARAMETER;
+
+    // Two enforcement paths exist and only one needs to be alive:
+    //   * NtTerminateProcess prologue hook -> can return per-rule custom
+    //     NTSTATUS to the terminator. HVCI typically blocks the CR0.WP
+    //     toggle, so this is best-effort.
+    //   * ObRegisterCallbacks pre-op -> strips PROCESS_TERMINATE from new
+    //     handles. HVCI-safe and signed-driver-friendly. Effective return
+    //     is always STATUS_ACCESS_DENIED (kernel synthesizes it when the
+    //     handle is missing the bit), so the per-rule Status is ignored
+    //     in this fallback path.
+    // Lazily register Ob callbacks so adds work even when the inline
+    // hook didn't install (HVCI). Refuse only if neither path is usable.
+    NTSTATUS obStatus = WinternalEnsureObCallbacks();
+    if (!g_NtTermHookInstalled && !NT_SUCCESS(obStatus)) return obStatus;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    if (g_ProcProtectCount >= WINTERNAL_PROC_PROTECT_MAX_RULES) {
+        KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+    WN_PROC_PROTECT_LIVE* r = &g_ProcProtect[g_ProcProtectCount];
+    r->RuleId     = g_ProcProtectNextId++;
+    r->BlockCount = 0;
+    r->Status     = (NTSTATUS)in->Status;
+    RtlCopyMemory(r->Pattern, in->Pattern, plen * sizeof(WCHAR));
+    r->Pattern[plen] = 0;
+    r->PatternLen = plen;
+    UINT32 assignedId = r->RuleId;
+    ++g_ProcProtectCount;
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+
+    PWINTERNAL_PROC_PROTECT_RULE out = (PWINTERNAL_PROC_PROTECT_RULE)OutBuf;
+    RtlCopyMemory(out, in, sizeof(*out));
+    out->RuleId     = assignedId;
+    out->BlockCount = 0;
+    // Tell the CLI which enforcement paths are live for this rule. CLI
+    // surfaces a warning if FLAG_HOOK_LIVE is missing AND the caller asked
+    // for a non-default Status, so the user knows their custom code is
+    // silently coerced to STATUS_ACCESS_DENIED on this machine.
+    out->Flags = 0;
+    if (g_NtTermHookInstalled)     out->Flags |= WINTERNAL_PROC_PROTECT_FLAG_HOOK_LIVE;
+    if (NT_SUCCESS(obStatus))      out->Flags |= WINTERNAL_PROC_PROTECT_FLAG_OB_LIVE;
+    *Written = sizeof(*out);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcProtectRemove(PVOID InBuf, size_t InLen)
+{
+    if (InLen < sizeof(WINTERNAL_PROC_PROTECT_REMOVE_IN)) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_PROTECT_REMOVE_IN in = (PWINTERNAL_PROC_PROTECT_REMOVE_IN)InBuf;
+    if (!g_ProcProtectSpinInit) return STATUS_NOT_FOUND;
+
+    KIRQL irql;
+    BOOLEAN removed = FALSE;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    for (ULONG i = 0; i < g_ProcProtectCount; ++i) {
+        if (g_ProcProtect[i].RuleId == in->RuleId) {
+            for (ULONG j = i; j + 1 < g_ProcProtectCount; ++j) g_ProcProtect[j] = g_ProcProtect[j + 1];
+            --g_ProcProtectCount;
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+    return removed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static NTSTATUS HandleProcProtectList(PVOID OutBuf, size_t OutLen, size_t* Written)
+{
+    size_t header = FIELD_OFFSET(WINTERNAL_PROC_PROTECT_LIST_OUT, Rules);
+    if (OutLen < header) return STATUS_BUFFER_TOO_SMALL;
+    PWINTERNAL_PROC_PROTECT_LIST_OUT out = (PWINTERNAL_PROC_PROTECT_LIST_OUT)OutBuf;
+    ULONG maxRules = (ULONG)((OutLen - header) / sizeof(WINTERNAL_PROC_PROTECT_RULE));
+
+    if (!g_ProcProtectSpinInit) {
+        out->Count = 0; out->Reserved = 0;
+        *Written = header;
+        return STATUS_SUCCESS;
+    }
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    ULONG toReturn = g_ProcProtectCount < maxRules ? g_ProcProtectCount : maxRules;
+    for (ULONG i = 0; i < toReturn; ++i) {
+        out->Rules[i].RuleId     = g_ProcProtect[i].RuleId;
+        out->Rules[i].BlockCount = g_ProcProtect[i].BlockCount;
+        out->Rules[i].Status     = (UINT32)g_ProcProtect[i].Status;
+        out->Rules[i].Flags      = 0;
+        if (g_NtTermHookInstalled) out->Rules[i].Flags |= WINTERNAL_PROC_PROTECT_FLAG_HOOK_LIVE;
+        if (g_ObCallbackHandle)    out->Rules[i].Flags |= WINTERNAL_PROC_PROTECT_FLAG_OB_LIVE;
+        RtlCopyMemory(out->Rules[i].Pattern, g_ProcProtect[i].Pattern,
+                      (g_ProcProtect[i].PatternLen + 1) * sizeof(WCHAR));
+    }
+    out->Count = toReturn;
+    out->Reserved = 0;
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+
+    *Written = header + toReturn * sizeof(WINTERNAL_PROC_PROTECT_RULE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS HandleProcProtectClear(VOID)
+{
+    if (!g_ProcProtectSpinInit) return STATUS_SUCCESS;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+    // Wipe the slots, not just the count — leaving stale Pattern bytes
+    // behind means the storage *looks* dirty in a debugger and (more
+    // importantly) protects against any future code path that forgets
+    // to gate on `Count > 0`. Also reset NextId so the next `add`
+    // returns rule 1, which is what users expect after a clear (we
+    // had IDs jumping 3 -> 4 after clear, which made the clear look
+    // half-applied even though enforcement was correctly disabled).
+    RtlZeroMemory(g_ProcProtect, sizeof(g_ProcProtect));
+    g_ProcProtectCount  = 0;
+    g_ProcProtectNextId = 1;
+    KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+    return STATUS_SUCCESS;
+}
+
+VOID WinternalProcMonitorShutdown(VOID)
+{
+    // Called from the driver-unload path to make sure the kernel
+    // doesn't keep a dangling pointer to our notify routine OR to the
+    // NtTerminateProcess detour (jmp into freed pool = guaranteed BSOD).
+    WinternalUninstallNtTermHook();
+    InterlockedExchange(&g_ProcMonActive, 0);
+    if (InterlockedCompareExchange(&g_ProcNotifyReg, 0, 1) == 1) {
+        (void)PsSetCreateProcessNotifyRoutineEx(WinternalProcNotify, TRUE);
+    }
+    if (g_ProcRuleSpinInit) {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_ProcRuleSpin, &irql);
+        g_ProcRuleCount = 0;
+        KeReleaseSpinLock(&g_ProcRuleSpin, irql);
+    }
+    if (g_ProcProtectSpinInit) {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_ProcProtectSpin, &irql);
+        g_ProcProtectCount = 0;
+        KeReleaseSpinLock(&g_ProcProtectSpin, irql);
+    }
+    if (g_ProcMonEventInit) KeSetEvent(&g_ProcMonEvent, IO_NO_INCREMENT, FALSE);
+}
+
+// -----------------------------------------------------------------------------
+// NtTerminateProcess prologue hook — undocumented attribution path. The
+// documented Ps* notify routines fire AFTER the kernel has decided to
+// terminate; they don't give us the caller's PID for `terminate by
+// another process` cases (taskkill /F, malware, etc.). Patching the
+// syscall entry lets us snapshot caller+target+status before the actual
+// teardown begins. Forwards an event of type WINTERNAL_PROC_EV_TERMINATE_REQ
+// into the same proc-monitor ring so `proc monitor` shows it inline.
+//
+// HVCI caveat: same as the NtUnloadDriver hook — CR0.WP-protected writes
+// to kernel code can be silently rejected. We log and degrade gracefully.
+// -----------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *PFN_NT_TERMINATE_PROCESS)(_In_opt_ HANDLE ProcessHandle,
+                                                  _In_ NTSTATUS ExitStatus);
+static PVOID  g_NtTermTarget        = NULL;
+static PUCHAR g_NtTermTrampoline    = NULL;
+static PFN_NT_TERMINATE_PROCESS g_NtTermOriginal = NULL;
+static UCHAR  g_NtTermSavedProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+static ULONG  g_NtTermPrologSize    = 0;
+// g_NtTermHookInstalled is forward-declared earlier (HandleProcProtectAdd
+// needs it) and defined here as the canonical home alongside the other
+// hook bookkeeping. Default-initialized to FALSE by the static BSS rules.
+
+static VOID WinternalEmitTerminateReq(UINT32 targetPid, UINT32 callerPid, NTSTATUS exitStatus)
+{
+    if (!g_ProcMonLockInit) return;
+
+    WINTERNAL_PROC_EVENT ev = {0};
+    LARGE_INTEGER ts;
+    KeQuerySystemTimePrecise(&ts);
+    ev.TimestampNs  = (UINT64)ts.QuadPart;
+    ev.EventType    = WINTERNAL_PROC_EV_TERMINATE_REQ;
+    ev.Pid          = targetPid;
+    ev.CreatingPid  = callerPid;
+    ev.Reserved     = (UINT32)exitStatus;
+    UINT32 cachedLen = 0;
+    (void)WinternalProcCacheGet(targetPid, ev.Image, WINTERNAL_PROC_IMAGE_MAX, &cachedLen);
+    ev.ImageLen = cachedLen;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ProcMonLock, &irql);
+    if (g_ProcRingCount >= (LONG)WINTERNAL_PROC_RING_SIZE) {
+        InterlockedIncrement((LONG*)&g_ProcDroppedSinceRead);
+    } else {
+        g_ProcRingCount++;
+    }
+    LONG slot = g_ProcRingHead;
+    g_ProcRingHead = (g_ProcRingHead + 1) % WINTERNAL_PROC_RING_SIZE;
+    g_ProcRing[slot] = ev;
+    KeReleaseSpinLock(&g_ProcMonLock, irql);
+    KeSetEvent(&g_ProcMonEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS NTAPI WinternalNtTerminateProcess_Detour(_In_opt_ HANDLE ProcessHandle,
+                                                          _In_ NTSTATUS ExitStatus)
+{
+    UINT32 callerPid = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+    UINT32 targetPid = 0;
+    BOOLEAN isSelf = FALSE;
+
+    // ProcessHandle == NtCurrentProcess() (-1) is self-termination.
+    // Resolve other handles via ObReferenceObjectByHandle; KernelMode
+    // previous-mode bypasses the access check since we only want the
+    // PID, not actual TERMINATE access.
+    if (ProcessHandle == NULL || ProcessHandle == (HANDLE)(LONG_PTR)-1) {
+        targetPid = callerPid;
+        isSelf    = TRUE;
+    } else {
+        PEPROCESS proc = NULL;
+        if (NT_SUCCESS(ObReferenceObjectByHandle(ProcessHandle, 0,
+                                                  *PsProcessType,
+                                                  ExGetPreviousMode(),
+                                                  (PVOID*)&proc, NULL))) {
+            targetPid = (UINT32)(ULONG_PTR)PsGetProcessId(proc);
+            // A handle that resolves to the caller's own PID is still
+            // "self" semantically — many runtimes terminate via a real
+            // handle from OpenProcess(GetCurrentProcessId()).
+            if (targetPid == callerPid) isSelf = TRUE;
+            ObDereferenceObject(proc);
+        }
+    }
+
+    // Consult the protect list — but never block self-termination, that
+    // would deadlock normal process exit (ntdll!RtlExitUserProcess calls
+    // NtTerminateProcess(NULL, ...) on every exit).
+    NTSTATUS finalStatus;
+    if (!isSelf && targetPid != 0) {
+        WCHAR  targetImg[WINTERNAL_PROC_IMAGE_MAX];
+        UINT32 cachedLen = 0;
+        if (WinternalProcCacheGet(targetPid, targetImg, WINTERNAL_PROC_IMAGE_MAX, &cachedLen) &&
+            cachedLen > 1) {
+            // Cache stores `n + 1` (chars including NUL); the wildcard
+            // matcher expects bare char count, so strip the terminator.
+            NTSTATUS overrideStatus = STATUS_ACCESS_DENIED;
+            UINT32 hit = WinternalProcProtectEvaluate(targetImg,
+                                                      (USHORT)(cachedLen - 1),
+                                                      &overrideStatus);
+            if (hit != 0) {
+                WinternalEmitTerminateReq(targetPid, callerPid, overrideStatus);
+                AuditAppend(IOCTL_WINTERNAL_PROC_PROTECT_ADD,
+                            (UINT64)callerPid, hit, overrideStatus);
+                return overrideStatus;
+            }
+        }
+    }
+
+    WinternalEmitTerminateReq(targetPid, callerPid, ExitStatus);
+    finalStatus = g_NtTermOriginal ? g_NtTermOriginal(ProcessHandle, ExitStatus)
+                                   : STATUS_NOT_IMPLEMENTED;
+    return finalStatus;
+}
+
+static NTSTATUS WinternalInstallNtTermHook(VOID)
+{
+    if (g_NtTermHookInstalled) return STATUS_SUCCESS;
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, L"NtTerminateProcess");
+    PVOID target = MmGetSystemRoutineAddress(&name);
+    if (!target) return STATUS_PROCEDURE_NOT_FOUND;
+
+    PUCHAR tramp = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE,
+                                           WINTERNAL_KHOOK_TRAMP_SIZE,
+                                           WINTERNAL_POOL_TAG_DEFAULT);
+    if (!tramp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    ULONG prolog = WINTERNAL_KHOOK_JMP_SIZE;
+    UCHAR newProlog[WINTERNAL_KHOOK_MAX_PROLOG];
+    NTSTATUS status;
+    __try {
+        RtlCopyMemory(g_NtTermSavedProlog, target, prolog);
+        RtlCopyMemory(tramp, target, prolog);
+        KhookWriteJmpAbs(tramp + prolog, (PUCHAR)target + prolog);
+        KhookWriteJmpAbs(newProlog, (PVOID)(ULONG_PTR)WinternalNtTerminateProcess_Detour);
+        status = STATUS_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+    __try {
+        status = WinternalProtectWriteCode(target, newProlog, prolog);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(tramp, WINTERNAL_POOL_TAG_DEFAULT);
+        return status;
+    }
+    g_NtTermTarget        = target;
+    g_NtTermTrampoline    = tramp;
+    g_NtTermOriginal      = (PFN_NT_TERMINATE_PROCESS)tramp;
+    g_NtTermPrologSize    = prolog;
+    g_NtTermHookInstalled = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static VOID WinternalUninstallNtTermHook(VOID)
+{
+    if (!g_NtTermHookInstalled) return;
+    (void)WinternalProtectWriteCode(g_NtTermTarget, g_NtTermSavedProlog, g_NtTermPrologSize);
+    if (g_NtTermTrampoline) {
+        ExFreePoolWithTag(g_NtTermTrampoline, WINTERNAL_POOL_TAG_DEFAULT);
+        g_NtTermTrampoline = NULL;
+    }
+    g_NtTermTarget        = NULL;
+    g_NtTermOriginal      = NULL;
+    g_NtTermPrologSize    = 0;
+    g_NtTermHookInstalled = FALSE;
+}
+
 // Lazy one-time registration. Altitude string is in the "free" altitude
 // range; it just needs to be unique on the system. If the system enforces
 // signing on ObRegisterCallbacks (some hardened SKUs do), this returns
@@ -1612,12 +2754,14 @@ VOID WinternalProtectUnregister(VOID)
 {
     // Order matters: pull our hook off ObUnRegisterCallbacks BEFORE calling
     // it ourselves, or we'd silently no-op our own cleanup. Also pull the
-    // syscall hook + minifilter — leaving them live across driver unload
-    // would land the next caller in freed pool (jmp) or freed FLT_FILTER
-    // (FltMgr) and bug-check the system.
+    // syscall hook + minifilter + process-notify routine — leaving any of
+    // them live across driver unload would land the next caller in freed
+    // pool (jmp) or freed FLT_FILTER / freed-callback (Ps*) and bug-check
+    // the system.
     WinternalFilterUnregister();
     WinternalUninstallNtUnloadHook();
     WinternalUninstallObUnregHook();
+    WinternalProcMonitorShutdown();
 
     if (g_ObCallbackHandle) {
         ObUnRegisterCallbacks(g_ObCallbackHandle);
@@ -2729,6 +3873,17 @@ static NTSTATUS HandleNtfsFilterAdd(PVOID, size_t, PVOID, size_t, size_t*);
 static NTSTATUS HandleNtfsFilterRemove(PVOID, size_t);
 static NTSTATUS HandleNtfsFilterList(PVOID, size_t, size_t*);
 static NTSTATUS HandleNtfsFilterClear(VOID);
+static NTSTATUS HandleProcMonitorStart(VOID);
+static NTSTATUS HandleProcMonitorStop(VOID);
+static NTSTATUS HandleProcMonitorRead(PVOID, size_t, size_t*);
+static NTSTATUS HandleProcRuleAdd(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleProcRuleRemove(PVOID, size_t);
+static NTSTATUS HandleProcRuleList(PVOID, size_t, size_t*);
+static NTSTATUS HandleProcRuleClear(VOID);
+static NTSTATUS HandleProcProtectAdd(PVOID, size_t, PVOID, size_t, size_t*);
+static NTSTATUS HandleProcProtectRemove(PVOID, size_t);
+static NTSTATUS HandleProcProtectList(PVOID, size_t, size_t*);
+static NTSTATUS HandleProcProtectClear(VOID);
 static NTSTATUS HandleForceUnload(PVOID, size_t);
 static NTSTATUS HandleKdrvRegister(PVOID, size_t);
 static NTSTATUS HandleKdrvDeregister(PVOID, size_t);
@@ -4415,6 +5570,39 @@ static NTSTATUS DispatchIoctl(ULONG Code, PVOID InBuf, size_t InLen,
         break;
     case IOCTL_WINTERNAL_NTFS_FILTER_CLEAR:
         status = HandleNtfsFilterClear();
+        break;
+    case IOCTL_WINTERNAL_PROC_MONITOR_START:
+        status = HandleProcMonitorStart();
+        break;
+    case IOCTL_WINTERNAL_PROC_MONITOR_STOP:
+        status = HandleProcMonitorStop();
+        break;
+    case IOCTL_WINTERNAL_PROC_MONITOR_READ:
+        status = HandleProcMonitorRead(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_PROC_RULE_ADD:
+        status = HandleProcRuleAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_PROC_RULE_REMOVE:
+        status = HandleProcRuleRemove(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_PROC_RULE_LIST:
+        status = HandleProcRuleList(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_PROC_RULE_CLEAR:
+        status = HandleProcRuleClear();
+        break;
+    case IOCTL_WINTERNAL_PROC_PROTECT_ADD:
+        status = HandleProcProtectAdd(InBuf, InLen, OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_PROC_PROTECT_REMOVE:
+        status = HandleProcProtectRemove(InBuf, InLen);
+        break;
+    case IOCTL_WINTERNAL_PROC_PROTECT_LIST:
+        status = HandleProcProtectList(OutBuf, OutLen, BytesWritten);
+        break;
+    case IOCTL_WINTERNAL_PROC_PROTECT_CLEAR:
+        status = HandleProcProtectClear();
         break;
     case IOCTL_WINTERNAL_SELFPROTECT_SET:
         status = HandleSelfProtectSet(InBuf, InLen);

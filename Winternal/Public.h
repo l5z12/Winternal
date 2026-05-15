@@ -469,6 +469,160 @@ typedef struct _WINTERNAL_NTFS_STREAMS_IN {
     WCHAR Path[WINTERNAL_NTFS_PATH_MAX];   // NT path like L"\\??\\C:\\Users\\..."
 } WINTERNAL_NTFS_STREAMS_IN, *PWINTERNAL_NTFS_STREAMS_IN;
 
+// ---- Real-time process monitor ----
+//
+// Driver registers PsSetCreateProcessNotifyRoutineEx and writes
+// create/exit events into an in-kernel ring. The CLI calls READ in a
+// loop; the driver blocks (up to 2s) waiting for new events and returns
+// however many it has. Cancelable via the CLI's Ctrl+C handler — each
+// read returns within the 2-second timeout so we can rerun and check
+// the abort flag.
+#define IOCTL_WINTERNAL_PROC_MONITOR_START  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_MONITOR_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_MONITOR_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_PROC_EV_CREATE        0u
+#define WINTERNAL_PROC_EV_EXIT          1u
+// Fired from the NtTerminateProcess prologue hook — gives us
+// attribution (CallerPid, TargetPid) before the kernel actually
+// performs the termination. CallerPid lands in the existing
+// `CreatingPid` field; the targeted image goes in `Image` resolved
+// from the PID cache. ExitStatus lives in `Reserved`.
+#define WINTERNAL_PROC_EV_TERMINATE_REQ 2u
+#define WINTERNAL_PROC_IMAGE_MAX  260u
+#define WINTERNAL_PROC_CMD_MAX    520u
+#define WINTERNAL_PROC_RING_SIZE  256u
+
+typedef struct _WINTERNAL_PROC_EVENT {
+    UINT64 TimestampNs;        // KeQuerySystemTimePrecise (100ns units)
+    UINT32 EventType;          // WINTERNAL_PROC_EV_*
+    UINT32 Pid;
+    UINT32 ParentPid;          // 0 on exit
+    UINT32 CreatingPid;        // process that called CreateProcess; 0 on exit
+    UINT32 CreatingTid;        // its thread; 0 on exit
+    UINT32 Dropped;            // events lost because the ring overflowed
+                               // before this one was read; non-zero only
+                               // on the first event after a drop.
+    UINT32 ImageLen;           // wchars including NUL, 0 if unavailable
+    UINT32 CmdLen;             // wchars including NUL
+    UINT32 Reserved;
+    WCHAR  Image[WINTERNAL_PROC_IMAGE_MAX];
+    WCHAR  CmdLine[WINTERNAL_PROC_CMD_MAX];
+} WINTERNAL_PROC_EVENT, *PWINTERNAL_PROC_EVENT;
+
+typedef struct _WINTERNAL_PROC_MON_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_PROC_EVENT Events[1];   // [Count]
+} WINTERNAL_PROC_MON_OUT, *PWINTERNAL_PROC_MON_OUT;
+
+// ---- Process-create block rules ----
+//
+// Extension of the process monitor: rule-driven IRP_MJ_CREATE-equivalent
+// for process creation. The notify routine (PsSetCreateProcessNotifyRoutineEx)
+// is registered once at DriverEntry and stays alive for the driver's
+// lifetime — rules add/remove/clear just mutate the in-kernel rule list,
+// no register churn at runtime. Patterns match the image-path the kernel
+// sees on create (CreateInfo->ImageFileName, e.g. \??\C:\Windows\System32\foo.exe)
+// with the same path-aware wildcard matcher the NTFS filter uses
+// (`*` spans `\`, `?` one char, case-insensitive).
+//
+// Actions on match:
+//   ALLOW (default if no rule) — pass through.
+//   DENY                       — set CreateInfo->CreationStatus =
+//                                STATUS_ACCESS_DENIED so the syscall
+//                                fails. Audit + ring entry both fire.
+//   LOG                        — audit + ring only; create proceeds.
+#define IOCTL_WINTERNAL_PROC_RULE_ADD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_RULE_REMOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_RULE_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_RULE_CLEAR  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// ---- Process-termination protect rules ----
+//
+// Rules describe images that may not be terminated. The undocumented
+// NtTerminateProcess prologue hook evaluates these against the target's
+// cached image at termination time; a match returns STATUS_ACCESS_DENIED
+// without calling the original handler. Both taskkill (from any session,
+// any privilege — including SYSTEM elevation, since it routes through
+// the syscall like everything else) and any other Nt-level terminator
+// are blocked. ProcessHandle == self is still allowed (we don't block
+// processes from exiting voluntarily).
+//
+// Distinct from PROC_RULE (which blocks CREATES, not exits). Distinct
+// from `protect <pid> --force` (which works at the Ob handle-open layer
+// and only strips destructive access bits from new handles).
+#define IOCTL_WINTERNAL_PROC_PROTECT_ADD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_PROTECT_REMOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A8, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_PROTECT_LIST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8A9, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINTERNAL_PROC_PROTECT_CLEAR  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8AA, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WINTERNAL_PROC_PROTECT_MAX_RULES   64
+#define WINTERNAL_PROC_PROTECT_PATTERN_MAX 260
+
+// Flags returned in WINTERNAL_PROC_PROTECT_RULE.Flags so the CLI can tell
+// the user which enforcement path is actually live for the rule they just
+// added. Bit 0 is the "inline hook on NtTerminateProcess" — the only path
+// capable of returning a custom NTSTATUS. When it's NOT set, the rule is
+// enforced solely by ObRegisterCallbacks stripping PROCESS_TERMINATE from
+// new handles, and the syscall return becomes STATUS_ACCESS_DENIED no
+// matter what `Status` was configured with.
+#define WINTERNAL_PROC_PROTECT_FLAG_HOOK_LIVE  0x00000001u
+#define WINTERNAL_PROC_PROTECT_FLAG_OB_LIVE    0x00000002u
+
+typedef struct _WINTERNAL_PROC_PROTECT_RULE {
+    UINT32 RuleId;                                              // 0 on ADD
+    UINT32 BlockCount;                                          // populated on LIST
+    UINT32 Status;                                              // NTSTATUS returned to terminator
+                                                                //   on match. Only honored when
+                                                                //   FLAG_HOOK_LIVE is set on ADD;
+                                                                //   otherwise enforcement falls
+                                                                //   back to the Ob handle-strip
+                                                                //   path which always yields
+                                                                //   STATUS_ACCESS_DENIED.
+    UINT32 Flags;                                               // see WINTERNAL_PROC_PROTECT_FLAG_*
+    WCHAR  Pattern[WINTERNAL_PROC_PROTECT_PATTERN_MAX];
+} WINTERNAL_PROC_PROTECT_RULE, *PWINTERNAL_PROC_PROTECT_RULE;
+
+typedef struct _WINTERNAL_PROC_PROTECT_REMOVE_IN {
+    UINT32 RuleId;
+    UINT32 Reserved;
+} WINTERNAL_PROC_PROTECT_REMOVE_IN, *PWINTERNAL_PROC_PROTECT_REMOVE_IN;
+
+typedef struct _WINTERNAL_PROC_PROTECT_LIST_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_PROC_PROTECT_RULE Rules[1];                       // [Count]
+} WINTERNAL_PROC_PROTECT_LIST_OUT, *PWINTERNAL_PROC_PROTECT_LIST_OUT;
+
+#define WINTERNAL_PROC_RULE_MAX_RULES   64
+#define WINTERNAL_PROC_RULE_PATTERN_MAX 260
+
+#define WINTERNAL_PROC_ACT_ALLOW 0
+#define WINTERNAL_PROC_ACT_DENY  1
+#define WINTERNAL_PROC_ACT_LOG   2
+
+typedef struct _WINTERNAL_PROC_RULE {
+    UINT32 RuleId;                                          // 0 on ADD; assigned by driver
+    UINT32 Action;                                          // WINTERNAL_PROC_ACT_*
+    UINT32 MatchCount;                                      // populated on LIST
+    UINT32 Status;                                          // when Action == DENY: NTSTATUS written
+                                                            //   to CreationStatus. 0 -> default
+                                                            //   STATUS_ACCESS_DENIED.
+    WCHAR  Pattern[WINTERNAL_PROC_RULE_PATTERN_MAX];        // wildcard pattern
+} WINTERNAL_PROC_RULE, *PWINTERNAL_PROC_RULE;
+
+typedef struct _WINTERNAL_PROC_RULE_REMOVE_IN {
+    UINT32 RuleId;
+    UINT32 Reserved;
+} WINTERNAL_PROC_RULE_REMOVE_IN, *PWINTERNAL_PROC_RULE_REMOVE_IN;
+
+typedef struct _WINTERNAL_PROC_RULE_LIST_OUT {
+    UINT32 Count;
+    UINT32 Reserved;
+    WINTERNAL_PROC_RULE Rules[1];                           // [Count]
+} WINTERNAL_PROC_RULE_LIST_OUT, *PWINTERNAL_PROC_RULE_LIST_OUT;
+
 // ---- NTFS filter (NtCreateFile hook + rule list) ----
 //
 // Each rule is { pattern, action }. Patterns use Windows wildcard syntax

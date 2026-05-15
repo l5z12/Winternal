@@ -36,6 +36,10 @@ VOID WinternalProtectSetSelf(PDRIVER_OBJECT Self);
 NTSTATUS WinternalFilterRegister(PDRIVER_OBJECT DriverObject);
 VOID     WinternalFilterUnregister(VOID);
 
+// Process monitor + create-block rules — register PsSet*NotifyRoutineEx
+// at DriverEntry so rules can fire even when no CLI is subscribed.
+NTSTATUS WinternalProcMonitorInit(VOID);
+
 // Defined in Device.c.
 NTSTATUS WinternalCreateControlDevice(_In_ WDFDRIVER Driver);
 
@@ -74,6 +78,19 @@ DriverEntry(
                        "[winternal] minifilter init failed 0x%08X — "
                        "`ntfs filter` will be inert until reinstalled.\n",
                        fltStatus);
+        }
+    }
+
+    // Register the process notify routine. Stays alive for the driver's
+    // lifetime so `proc rule add … deny` works regardless of whether a
+    // CLI is subscribed to `proc monitor`.
+    {
+        NTSTATUS procStatus = WinternalProcMonitorInit();
+        if (!NT_SUCCESS(procStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[winternal] proc notify init failed 0x%08X — "
+                       "`proc monitor` and `proc rule` will be inert.\n",
+                       procStatus);
         }
     }
 
